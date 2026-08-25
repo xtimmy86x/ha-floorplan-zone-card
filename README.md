@@ -1,6 +1,6 @@
 # Floorplan Zone Card
 
-A Home Assistant custom dashboard card for displaying a floorplan with polygon zones driven by entity state.
+A Home Assistant custom dashboard card for displaying a floorplan with polygon zones driven by entity state and standard Home Assistant actions.
 
 ![Floorplan Zone Card preview](images/preview.svg)
 
@@ -11,10 +11,11 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 3. draw the zone directly on the floorplan;
 4. select any Home Assistant entity;
 5. add as many exact state → color/opacity rules as needed;
-6. save the card in the normal Home Assistant dashboard editor.
+6. optionally configure tap, hold, and double-tap actions;
+7. save the card in the normal Home Assistant dashboard editor.
 
 > [!IMPORTANT]
-> This repository is in active early development. The editor supports Home Assistant-native image/media and entity selectors, graphical polygon editing, and unlimited exact-state styling rules per zone.
+> This repository is in active early development. The editor supports Home Assistant-native image/media, entity and action selectors, graphical polygon editing, and unlimited exact-state styling rules per zone.
 
 ## Current development scope
 
@@ -26,6 +27,9 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Unlimited exact raw-state color/opacity rules per zone.
 - Separate fallback and unavailable/unknown styles.
 - Backward-compatible migration of legacy binary `on` / `off` zone styles.
+- Native Home Assistant `tap_action`, `hold_action`, and `double_tap_action` per zone.
+- Standard `hass-action` dispatch for Lovelace actions.
+- Keyboard activation for actionable zones with Enter/Space.
 - Responsive image + SVG overlay renderer.
 - Resolution of `media-source://` images through Home Assistant before rendering.
 - Normalized polygon coordinates (`0..1`) so zones remain aligned while resizing.
@@ -35,6 +39,45 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Selected-vertex deletion while preserving the minimum three-point polygon.
 - Vertex updates committed only on pointer release.
 - HACS-compatible `dist/ha-floorplan-zone-card.js` output.
+
+## Zone actions
+
+Each zone can use Home Assistant's normal Lovelace action model:
+
+```yaml
+tap_action:
+  action: more-info
+hold_action:
+  action: none
+double_tap_action:
+  action: none
+```
+
+The visual editor uses Home Assistant's native `ui_action` selector, so actions such as `more-info`, `toggle`, `perform-action`, `navigate`, `url`, `assist`, `none`, confirmations, targets and action data can be configured using the standard Home Assistant UI.
+
+A zone can therefore toggle its linked entity:
+
+```yaml
+entity: light.workshop
+tap_action:
+  action: toggle
+hold_action:
+  action: more-info
+```
+
+or execute a Home Assistant action independently from the entity used for its color:
+
+```yaml
+entity: sensor.machine_state
+tap_action:
+  action: perform-action
+  perform_action: script.machine_reset
+  confirmation: true
+```
+
+Actions are executed only in the normal dashboard view. They are disabled while the polygon editor is drawing or editing zone geometry.
+
+For compatibility, an existing zone with an entity and no explicit `tap_action` behaves as `more-info`. Newly drawn zones start with `more-info` on tap and `none` for hold/double tap.
 
 ## State color rules
 
@@ -124,6 +167,12 @@ zones:
         y: 0.8
       - x: 0.2
         y: 0.8
+    tap_action:
+      action: more-info
+    hold_action:
+      action: none
+    double_tap_action:
+      action: none
     states:
       - value: "idle"
         color: "#808080"
@@ -158,7 +207,8 @@ When a zone is in **Edit shape** mode:
 - click a small white midpoint handle to insert a new vertex on that edge;
 - the last moved/inserted vertex becomes selected;
 - use **Delete vertex** to remove it when the polygon has more than three points;
-- coordinates are saved only when the pointer is released.
+- coordinates are saved only when the pointer is released;
+- configured zone actions are not executed while editing.
 
 ## Development
 
@@ -203,6 +253,7 @@ dist/ha-floorplan-zone-card.js
 - [x] Native unrestricted entity selector
 - [x] Unlimited exact-state color/opacity rules
 - [x] Fallback and unavailable styles
+- [x] Native zone tap/hold/double-tap actions
 - [ ] Undo/redo for saved shape edits
 - [ ] Mobile editor polish
 - [ ] Runtime UX testing on a real Home Assistant dashboard
@@ -210,7 +261,6 @@ dist/ha-floorplan-zone-card.js
 ### Later
 
 - [ ] Numeric range rules (for example `< 20`, `20–40`, `> 40`)
-- [ ] Optional zone click actions
 
 ## License
 
