@@ -12,7 +12,7 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 6. save the card in the normal Home Assistant dashboard editor.
 
 > [!IMPORTANT]
-> This repository is at the first development milestone. The card and graphical editor are registered and functional, zones render from normalized coordinates, and the editor can create/configure placeholder zones. Point-and-click polygon drawing and native Home Assistant image upload are the next milestones.
+> This repository is in active early development. The graphical editor can now draw polygons point-by-point, select existing zones, and drag vertices directly on the floorplan. Native Home Assistant image upload and entity selectors are planned next.
 
 ## Current development scope
 
@@ -20,6 +20,9 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Native graphical card editor through `getConfigElement()` and `config-changed`.
 - Responsive image + SVG overlay renderer.
 - Normalized polygon coordinates (`0..1`) so zones remain aligned while resizing.
+- Point-and-click polygon drawing with close/cancel/undo controls.
+- Existing-zone selection and draggable polygon vertices.
+- Vertex updates committed only on pointer release.
 - `binary_sensor` ON/OFF/unavailable styling.
 - Basic visual zone settings for name, entity, colors, and opacity.
 - Dependency-free browser bundle for a small first foundation.
@@ -53,7 +56,7 @@ zones:
 
 ## Development
 
-Requires Node.js 22 or newer. There are no runtime or build dependencies in the first milestone.
+Requires Node.js 22 or newer. There are no runtime or build dependencies in the current development version.
 
 ```bash
 npm run check
@@ -79,20 +82,21 @@ dist/ha-floorplan-zone-card.js
 
 ### Milestone 2 — graphical polygon editor
 
-- [ ] Add-zone drawing mode
-- [ ] Click points directly on the image
-- [ ] Close/cancel polygon controls
-- [ ] Select existing polygons
-- [ ] Drag polygon vertices
+- [x] Add-zone drawing mode
+- [x] Click points directly on the image
+- [x] Close/cancel polygon controls
+- [x] Undo last point while drawing
+- [x] Select existing polygons
+- [x] Drag polygon vertices
 - [ ] Delete/insert vertices
-- [ ] Commit config changes on pointer release rather than every pointer move
+- [x] Commit config changes on pointer release rather than every pointer move
 
 ### Milestone 3 — Home Assistant-native UX
 
 - [ ] Native Home Assistant image upload/media selector
 - [ ] Native entity selector restricted to `binary_sensor`
 - [ ] Better color/opacity controls
-- [ ] Undo/redo
+- [ ] Undo/redo for saved shape edits
 - [ ] Mobile editor polish
 
 ## License
