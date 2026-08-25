@@ -27,3 +27,6 @@ jobs:
       - uses: hacs/action@main
         with:
           category: plugin
+          # The GitHub connector used for bootstrapping cannot edit repository
+          # description/topics. Remove these ignores once those metadata are set.
+          ignore: description topics
