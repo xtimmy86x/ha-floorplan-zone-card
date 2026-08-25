@@ -2,6 +2,8 @@
 
 A Home Assistant custom dashboard card for displaying a floorplan with simple polygon zones driven by entity state.
 
+![Floorplan Zone Card preview](images/preview.svg)
+
 The goal is a configuration flow that does **not** require editing SVG files, writing YAML overlays, or maintaining custom CSS:
 
 1. choose a floorplan image;
