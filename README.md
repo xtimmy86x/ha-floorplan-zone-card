@@ -1,6 +1,6 @@
 # Floorplan Zone Card
 
-A Home Assistant custom dashboard card for displaying a floorplan with simple polygon zones driven by entity state.
+A Home Assistant custom dashboard card for displaying a floorplan with polygon zones driven by entity state.
 
 ![Floorplan Zone Card preview](images/preview.svg)
 
@@ -9,12 +9,12 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 1. choose or upload a floorplan image;
 2. add a zone;
 3. draw the zone directly on the floorplan;
-4. select a `binary_sensor` from the Home Assistant entity picker;
-5. choose ON/OFF colors and opacity;
+4. select any Home Assistant entity;
+5. add as many exact state → color/opacity rules as needed;
 6. save the card in the normal Home Assistant dashboard editor.
 
 > [!IMPORTANT]
-> This repository is in active early development. The editor now uses Home Assistant-native image/media and entity selectors, supports point-by-point polygon drawing, draggable vertices, and vertex insertion/removal directly on the floorplan.
+> This repository is in active early development. The editor supports Home Assistant-native image/media and entity selectors, graphical polygon editing, and unlimited exact-state styling rules per zone.
 
 ## Current development scope
 
@@ -22,8 +22,10 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Native graphical card editor through `getConfigElement()` and `config-changed`.
 - Home Assistant image/media selector with image upload support.
 - Backward-compatible support for legacy image URL/path configurations.
-- Home Assistant entity selector restricted to `binary_sensor`.
-- Home Assistant form controls for zone colors and opacity sliders.
+- Home Assistant entity selector with no domain restriction.
+- Unlimited exact raw-state color/opacity rules per zone.
+- Separate fallback and unavailable/unknown styles.
+- Backward-compatible migration of legacy binary `on` / `off` zone styles.
 - Responsive image + SVG overlay renderer.
 - Resolution of `media-source://` images through Home Assistant before rendering.
 - Normalized polygon coordinates (`0..1`) so zones remain aligned while resizing.
@@ -32,8 +34,73 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Midpoint handles for inserting new vertices.
 - Selected-vertex deletion while preserving the minimum three-point polygon.
 - Vertex updates committed only on pointer release.
-- `binary_sensor` ON/OFF/unavailable styling.
 - HACS-compatible `dist/ha-floorplan-zone-card.js` output.
+
+## State color rules
+
+Each zone can use any Home Assistant entity. Rules compare against the entity's **raw state** (`hass.states[entity_id].state`) using exact string matching.
+
+For example, a machine-state sensor can map an arbitrary number of values:
+
+```yaml
+entity: sensor.machine_state
+states:
+  - value: "0"
+    color: "#808080"
+    opacity: 0.15
+  - value: "1"
+    color: "#00c853"
+    opacity: 0.45
+  - value: "2"
+    color: "#ffcc00"
+    opacity: 0.55
+  - value: "3"
+    color: "#ff0000"
+    opacity: 0.65
+default:
+  color: "#808080"
+  opacity: 0.10
+unavailable:
+  color: "#9e9e9e"
+  opacity: 0.20
+```
+
+Rules are evaluated in this order:
+
+1. missing, `unknown`, or `unavailable` entity state → `unavailable` style;
+2. first exact matching entry in `states` → that rule's style;
+3. no matching rule → `default` fallback style.
+
+The visual editor provides **Add state** and **Delete** controls and does not impose a limit on the number of state rules.
+
+Newly drawn zones start with `off` and `on` rules as a convenience for binary entities, but they can be edited, removed, or replaced with any values.
+
+## Backward compatibility
+
+Legacy binary configurations remain supported. Existing zones like:
+
+```yaml
+on:
+  color: "#ff3b30"
+  opacity: 0.55
+off:
+  color: "#808080"
+  opacity: 0.08
+```
+
+are normalized internally to:
+
+```yaml
+states:
+  - value: "off"
+    color: "#808080"
+    opacity: 0.08
+  - value: "on"
+    color: "#ff3b30"
+    opacity: 0.55
+```
+
+No manual migration is required.
 
 ## Example configuration
 
@@ -47,7 +114,7 @@ image:
 zones:
   - id: zone_1
     name: Machine room
-    entity: binary_sensor.machine_room_alarm
+    entity: sensor.machine_state
     points:
       - x: 0.2
         y: 0.2
@@ -57,12 +124,22 @@ zones:
         y: 0.8
       - x: 0.2
         y: 0.8
-    "on":
-      color: "#ff3b30"
-      opacity: 0.55
-    "off":
+    states:
+      - value: "idle"
+        color: "#808080"
+        opacity: 0.15
+      - value: "running"
+        color: "#00c853"
+        opacity: 0.45
+      - value: "alarm"
+        color: "#ff0000"
+        opacity: 0.65
+    default:
       color: "#808080"
-      opacity: 0.08
+      opacity: 0.10
+    unavailable:
+      color: "#9e9e9e"
+      opacity: 0.20
 ```
 
 Existing configurations using a direct URL or Home Assistant `/local/` path remain supported:
@@ -106,7 +183,7 @@ dist/ha-floorplan-zone-card.js
 - [x] Graphical config editor registration
 - [x] Image + SVG overlay
 - [x] Normalized polygon model
-- [x] Live binary sensor styling
+- [x] Live entity-state styling
 - [x] Basic zone properties
 
 ### Milestone 2 — graphical polygon editor
@@ -123,11 +200,17 @@ dist/ha-floorplan-zone-card.js
 ### Milestone 3 — Home Assistant-native UX
 
 - [x] Native Home Assistant image upload/media selector
-- [x] Native entity selector restricted to `binary_sensor`
-- [x] Native color and opacity controls
+- [x] Native unrestricted entity selector
+- [x] Unlimited exact-state color/opacity rules
+- [x] Fallback and unavailable styles
 - [ ] Undo/redo for saved shape edits
 - [ ] Mobile editor polish
 - [ ] Runtime UX testing on a real Home Assistant dashboard
+
+### Later
+
+- [ ] Numeric range rules (for example `< 20`, `20–40`, `> 40`)
+- [ ] Optional zone click actions
 
 ## License
 
