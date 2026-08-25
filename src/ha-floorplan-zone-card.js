@@ -2,14 +2,15 @@ const CARD_TYPE = "floorplan-zone-card";
 const CARD_TAG = "floorplan-zone-card";
 const EDITOR_TAG = "floorplan-zone-card-editor";
 const CANVAS_TAG = "floorplan-zone-canvas";
-const VERSION = "0.1.0-dev.2";
+const VERSION = "0.1.0-dev.3";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const SVG_SIZE = 1000;
 
-const DEFAULT_ON_STYLE = Object.freeze({ color: "#ff3b30", opacity: 0.55 });
-const DEFAULT_OFF_STYLE = Object.freeze({ color: "#808080", opacity: 0.08 });
+const DEFAULT_FALLBACK_STYLE = Object.freeze({ color: "#808080", opacity: 0.08 });
 const DEFAULT_UNAVAILABLE_STYLE = Object.freeze({ color: "#9e9e9e", opacity: 0.2 });
 const DEFAULT_STROKE = Object.freeze({ color: "#ffffff", width: 2 });
+const DEFAULT_ON_STYLE = Object.freeze({ color: "#ff3b30", opacity: 0.55 });
+const DEFAULT_OFF_STYLE = Object.freeze({ color: "#808080", opacity: 0.08 });
 
 function deepClone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -23,16 +24,51 @@ function normalizePoint(point) {
   return { x: clamp01(point?.x), y: clamp01(point?.y) };
 }
 
+function normalizeStyle(style, fallback) {
+  return {
+    color: typeof style?.color === "string" && style.color ? style.color : fallback.color,
+    opacity: clamp01(style?.opacity ?? fallback.opacity),
+  };
+}
+
+function normalizeStateRule(rule) {
+  return {
+    value: rule?.value === undefined || rule?.value === null ? "" : String(rule.value),
+    ...normalizeStyle(rule, DEFAULT_FALLBACK_STYLE),
+  };
+}
+
+function legacyStateRules(zone) {
+  const rules = [];
+  if (zone?.off) rules.push({ value: "off", ...normalizeStyle(zone.off, DEFAULT_OFF_STYLE) });
+  if (zone?.on) rules.push({ value: "on", ...normalizeStyle(zone.on, DEFAULT_ON_STYLE) });
+  return rules;
+}
+
+function normalizeZone(zone) {
+  const normalized = {
+    ...zone,
+    points: Array.isArray(zone?.points) ? zone.points.map(normalizePoint) : [],
+    states: Array.isArray(zone?.states)
+      ? zone.states.map(normalizeStateRule)
+      : legacyStateRules(zone),
+    default: normalizeStyle(zone?.default, DEFAULT_FALLBACK_STYLE),
+    unavailable: normalizeStyle(zone?.unavailable, DEFAULT_UNAVAILABLE_STYLE),
+    stroke: {
+      color: typeof zone?.stroke?.color === "string" ? zone.stroke.color : DEFAULT_STROKE.color,
+      width: Number.isFinite(Number(zone?.stroke?.width)) ? Number(zone.stroke.width) : DEFAULT_STROKE.width,
+    },
+  };
+  delete normalized.on;
+  delete normalized.off;
+  return normalized;
+}
+
 function normalizedConfig(config) {
   const clone = deepClone(config ?? {});
   return {
     ...clone,
-    zones: Array.isArray(clone.zones)
-      ? clone.zones.map((zone) => ({
-          ...zone,
-          points: Array.isArray(zone.points) ? zone.points.map(normalizePoint) : [],
-        }))
-      : [],
+    zones: Array.isArray(clone.zones) ? clone.zones.map(normalizeZone) : [],
   };
 }
 
@@ -51,18 +87,28 @@ function createZone(points, zones) {
     name: `Zone ${number}`,
     entity: "",
     points: points.map(normalizePoint),
-    on: { ...DEFAULT_ON_STYLE },
-    off: { ...DEFAULT_OFF_STYLE },
+    states: [
+      { value: "off", ...DEFAULT_OFF_STYLE },
+      { value: "on", ...DEFAULT_ON_STYLE },
+    ],
+    default: { ...DEFAULT_FALLBACK_STYLE },
     unavailable: { ...DEFAULT_UNAVAILABLE_STYLE },
     stroke: { ...DEFAULT_STROKE },
   };
 }
 
+function entityRawState(hass, entityId) {
+  if (!entityId) return undefined;
+  return hass?.states?.[entityId]?.state;
+}
+
 function stateStyle(hass, zone) {
-  const state = zone.entity ? hass?.states?.[zone.entity]?.state : undefined;
-  if (state === "on") return zone.on ?? DEFAULT_ON_STYLE;
-  if (state === "off") return zone.off ?? DEFAULT_OFF_STYLE;
-  return zone.unavailable ?? DEFAULT_UNAVAILABLE_STYLE;
+  const state = entityRawState(hass, zone.entity);
+  if (state === undefined || state === "unknown" || state === "unavailable") {
+    return zone.unavailable ?? DEFAULT_UNAVAILABLE_STYLE;
+  }
+  const rule = (zone.states ?? []).find((item) => String(item.value) === state);
+  return rule ?? zone.default ?? DEFAULT_FALLBACK_STYLE;
 }
 
 function pointList(points) {
@@ -144,8 +190,9 @@ class FloorplanZoneCanvas extends HTMLElement {
       interactive: Boolean(state?.interactive),
       mode: state?.mode ?? "view",
       selectedZoneId: state?.selectedZoneId ?? null,
-      selectedVertexIndex:
-        Number.isInteger(state?.selectedVertexIndex) ? state.selectedVertexIndex : null,
+      selectedVertexIndex: Number.isInteger(state?.selectedVertexIndex)
+        ? state.selectedVertexIndex
+        : null,
       draftPoints: Array.isArray(state?.draftPoints) ? state.draftPoints.map(normalizePoint) : [],
     };
     this.render();
@@ -198,13 +245,7 @@ class FloorplanZoneCanvas extends HTMLElement {
   }
 
   dispatchEditorEvent(name, detail = {}) {
-    this.dispatchEvent(
-      new CustomEvent(name, {
-        bubbles: true,
-        composed: true,
-        detail,
-      }),
-    );
+    this.dispatchEvent(new CustomEvent(name, { bubbles: true, composed: true, detail }));
   }
 
   pointerPoint(event, svg) {
@@ -245,65 +286,30 @@ class FloorplanZoneCanvas extends HTMLElement {
     this._drag = null;
     this.shadowRoot.replaceChildren();
 
-    const interactive = this._editorState.interactive;
-    const mode = this._editorState.mode;
-    const selectedZoneId = this._editorState.selectedZoneId;
-    const selectedVertexIndex = this._editorState.selectedVertexIndex;
-    const draftPoints = this._editorState.draftPoints;
+    const { interactive, mode, selectedZoneId, selectedVertexIndex, draftPoints } = this._editorState;
     const imageConfigured = Boolean(imageContentId(this._config?.image));
 
     const style = document.createElement("style");
     style.textContent = `
-      :host { display: block; }
-      .canvas {
-        position: relative;
-        overflow: hidden;
-        border-radius: var(--ha-card-border-radius, 12px);
-        background: var(--secondary-background-color, #eeeeee);
-      }
-      .canvas.empty { aspect-ratio: 16 / 9; min-height: 220px; }
-      img { display: block; width: 100%; height: auto; user-select: none; pointer-events: none; }
-      svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
-      svg.interactive { touch-action: none; }
-      polygon.zone {
-        vector-effect: non-scaling-stroke;
-        transition: fill 160ms ease, fill-opacity 160ms ease, stroke 120ms ease;
-      }
-      polygon.selectable { cursor: pointer; }
-      polygon.selected { stroke: var(--primary-color, #03a9f4) !important; stroke-width: 4 !important; }
-      .draft-line {
-        fill: none; stroke: var(--primary-color, #03a9f4); stroke-width: 4;
-        vector-effect: non-scaling-stroke; pointer-events: none;
-      }
-      .draft-point, .vertex {
-        fill: var(--primary-color, #03a9f4); stroke: var(--card-background-color, #ffffff);
-        stroke-width: 3; vector-effect: non-scaling-stroke;
-      }
-      .vertex.selected-vertex {
-        fill: var(--warning-color, #ff9800);
-        stroke-width: 5;
-      }
-      .midpoint {
-        fill: var(--card-background-color, #ffffff);
-        stroke: var(--primary-color, #03a9f4);
-        stroke-width: 3; vector-effect: non-scaling-stroke;
-        cursor: copy;
-      }
-      .draft-point { pointer-events: none; }
-      .draft-point.close-target { pointer-events: auto; cursor: pointer; }
-      .vertex { cursor: grab; }
-      .vertex:active { cursor: grabbing; }
-      .empty-message {
-        position: absolute; inset: 0; display: grid; place-items: center; padding: 24px;
-        box-sizing: border-box; text-align: center; color: var(--secondary-text-color, #727272);
-        font-size: 14px; pointer-events: none;
-      }
-      .draw-hint {
-        position: absolute; left: 12px; bottom: 12px; z-index: 2;
-        padding: 7px 10px; border-radius: 8px;
-        background: color-mix(in srgb, var(--card-background-color, #fff) 88%, transparent);
-        color: var(--primary-text-color, #212121); font-size: 12px; pointer-events: none;
-      }
+      :host { display:block; }
+      .canvas { position:relative; overflow:hidden; border-radius:var(--ha-card-border-radius,12px); background:var(--secondary-background-color,#eee); }
+      .canvas.empty { aspect-ratio:16/9; min-height:220px; }
+      img { display:block; width:100%; height:auto; user-select:none; pointer-events:none; }
+      svg { position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
+      svg.interactive { touch-action:none; }
+      polygon.zone { vector-effect:non-scaling-stroke; transition:fill 160ms ease,fill-opacity 160ms ease,stroke 120ms ease; }
+      polygon.selectable { cursor:pointer; }
+      polygon.selected { stroke:var(--primary-color,#03a9f4)!important; stroke-width:4!important; }
+      .draft-line { fill:none; stroke:var(--primary-color,#03a9f4); stroke-width:4; vector-effect:non-scaling-stroke; pointer-events:none; }
+      .draft-point,.vertex { fill:var(--primary-color,#03a9f4); stroke:var(--card-background-color,#fff); stroke-width:3; vector-effect:non-scaling-stroke; }
+      .vertex.selected-vertex { fill:var(--warning-color,#ff9800); stroke-width:5; }
+      .midpoint { fill:var(--card-background-color,#fff); stroke:var(--primary-color,#03a9f4); stroke-width:3; vector-effect:non-scaling-stroke; cursor:copy; }
+      .draft-point { pointer-events:none; }
+      .draft-point.close-target { pointer-events:auto; cursor:pointer; }
+      .vertex { cursor:grab; }
+      .vertex:active { cursor:grabbing; }
+      .empty-message { position:absolute; inset:0; display:grid; place-items:center; padding:24px; box-sizing:border-box; text-align:center; color:var(--secondary-text-color,#727272); font-size:14px; pointer-events:none; }
+      .draw-hint { position:absolute; left:12px; bottom:12px; z-index:2; padding:7px 10px; border-radius:8px; background:color-mix(in srgb,var(--card-background-color,#fff) 88%,transparent); color:var(--primary-text-color,#212121); font-size:12px; pointer-events:none; }
     `;
 
     const container = document.createElement("div");
@@ -318,13 +324,11 @@ class FloorplanZoneCanvas extends HTMLElement {
       container.classList.add("empty");
       const message = document.createElement("div");
       message.className = "empty-message";
-      if (imageConfigured) {
-        message.textContent = "Loading floorplan image…";
-      } else {
-        message.textContent = interactive
+      message.textContent = imageConfigured
+        ? "Loading floorplan image…"
+        : interactive
           ? "Choose or upload a floorplan image, then draw zones on this canvas."
           : "Choose a floorplan image in the card editor.";
-      }
       container.append(message);
     }
 
@@ -342,8 +346,8 @@ class FloorplanZoneCanvas extends HTMLElement {
       polygon.classList.add("zone");
       polygon.dataset.zoneId = zone.id ?? "";
       polygon.setAttribute("points", pointList(zone.points));
-      polygon.setAttribute("fill", zoneStyle.color ?? DEFAULT_UNAVAILABLE_STYLE.color);
-      polygon.setAttribute("fill-opacity", String(zoneStyle.opacity ?? DEFAULT_UNAVAILABLE_STYLE.opacity));
+      polygon.setAttribute("fill", zoneStyle.color ?? DEFAULT_FALLBACK_STYLE.color);
+      polygon.setAttribute("fill-opacity", String(zoneStyle.opacity ?? DEFAULT_FALLBACK_STYLE.opacity));
       polygon.setAttribute("stroke", zone.stroke?.color ?? "transparent");
       polygon.setAttribute("stroke-width", String(zone.stroke?.width ?? 0));
 
@@ -362,7 +366,8 @@ class FloorplanZoneCanvas extends HTMLElement {
       }
 
       const title = document.createElementNS(SVG_NS, "title");
-      title.textContent = zone.name || zone.entity || zone.id || "Zone";
+      const rawState = entityRawState(this._hass, zone.entity);
+      title.textContent = `${zone.name || zone.entity || zone.id || "Zone"}${rawState !== undefined ? ` · ${rawState}` : ""}`;
       polygon.append(title);
       svg.append(polygon);
 
@@ -374,7 +379,6 @@ class FloorplanZoneCanvas extends HTMLElement {
           const next = zone.points[(edgeIndex + 1) % zone.points.length];
           const midpoint = document.createElementNS(SVG_NS, "circle");
           midpoint.classList.add("midpoint");
-          midpoint.dataset.edgeIndex = String(edgeIndex);
           midpoint.setAttribute("cx", String(((point.x + next.x) / 2) * SVG_SIZE));
           midpoint.setAttribute("cy", String(((point.y + next.y) / 2) * SVG_SIZE));
           midpoint.setAttribute("r", "8");
@@ -395,7 +399,6 @@ class FloorplanZoneCanvas extends HTMLElement {
           const handle = document.createElementNS(SVG_NS, "circle");
           handle.classList.add("vertex");
           if (vertexIndex === selectedVertexIndex) handle.classList.add("selected-vertex");
-          handle.dataset.vertexIndex = String(vertexIndex);
           handle.setAttribute("cx", String(point.x * SVG_SIZE));
           handle.setAttribute("cy", String(point.y * SVG_SIZE));
           handle.setAttribute("r", vertexIndex === selectedVertexIndex ? "13" : "11");
@@ -411,11 +414,7 @@ class FloorplanZoneCanvas extends HTMLElement {
               handles,
               midpointHandles,
             };
-            try {
-              svg.setPointerCapture(event.pointerId);
-            } catch (_error) {
-              // Pointer capture is an optimization; dragging still works without it.
-            }
+            try { svg.setPointerCapture(event.pointerId); } catch (_error) { /* optional */ }
           });
           handles.push(handle);
           svg.append(handle);
@@ -448,8 +447,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       });
 
       svg.addEventListener("click", (event) => {
-        const point = this.pointerPoint(event, svg);
-        this.dispatchEditorEvent("floorplan-draw-point", { point });
+        this.dispatchEditorEvent("floorplan-draw-point", { point: this.pointerPoint(event, svg) });
       });
 
       const hint = document.createElement("div");
@@ -479,11 +477,7 @@ class FloorplanZoneCanvas extends HTMLElement {
             points: drag.points.map(normalizePoint),
           });
         }
-        try {
-          svg.releasePointerCapture(event.pointerId);
-        } catch (_error) {
-          // Ignore browsers that did not establish pointer capture.
-        }
+        try { svg.releasePointerCapture(event.pointerId); } catch (_error) { /* optional */ }
         this._drag = null;
         if (!commit) this.render();
       };
@@ -514,9 +508,7 @@ class FloorplanZoneCard extends HTMLElement {
   }
 
   setConfig(config) {
-    if (!config || typeof config !== "object") {
-      throw new Error("Invalid Floorplan Zone Card configuration.");
-    }
+    if (!config || typeof config !== "object") throw new Error("Invalid Floorplan Zone Card configuration.");
     this._config = normalizedConfig(config);
     this.render();
   }
@@ -545,14 +537,11 @@ class FloorplanZoneCard extends HTMLElement {
 
     const style = document.createElement("style");
     style.textContent = `
-      :host { display: block; }
-      ha-card { overflow: hidden; }
-      .header {
-        padding: 16px 16px 0; color: var(--ha-card-header-color, var(--primary-text-color));
-        font-size: var(--ha-card-header-font-size, 24px); line-height: 1.2;
-      }
-      .content { padding: 16px; }
-      .header + .content { padding-top: 12px; }
+      :host { display:block; }
+      ha-card { overflow:hidden; }
+      .header { padding:16px 16px 0; color:var(--ha-card-header-color,var(--primary-text-color)); font-size:var(--ha-card-header-font-size,24px); line-height:1.2; }
+      .content { padding:16px; }
+      .header + .content { padding-top:12px; }
     `;
 
     const card = document.createElement("ha-card");
@@ -584,6 +573,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
     this._selectedZoneId = null;
     this._selectedVertexIndex = null;
     this._draftPoints = [];
+    this._haFormReadyListener = null;
   }
 
   setConfig(config) {
@@ -593,10 +583,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
       this._selectedZoneId = null;
       this._selectedVertexIndex = null;
       if (this._mode === "edit") this._mode = "select";
-    } else if (
-      this._selectedVertexIndex !== null &&
-      this._selectedVertexIndex >= selectedZone.points.length
-    ) {
+    } else if (this._selectedVertexIndex !== null && this._selectedVertexIndex >= selectedZone.points.length) {
       this._selectedVertexIndex = null;
     }
     this.render();
@@ -605,9 +592,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
   set hass(hass) {
     this._hass = hass;
     this.updatePreview();
-    this.shadowRoot?.querySelectorAll("ha-form").forEach((form) => {
-      form.hass = hass;
-    });
+    this.shadowRoot?.querySelectorAll("ha-form").forEach((form) => { form.hass = hass; });
   }
 
   get hass() {
@@ -616,16 +601,21 @@ class FloorplanZoneCardEditor extends HTMLElement {
 
   connectedCallback() {
     this.render();
+    if (!customElements.get("ha-form") && !this._haFormReadyListener) {
+      this._haFormReadyListener = true;
+      customElements.whenDefined("ha-form").then(() => {
+        this._haFormReadyListener = null;
+        if (this.isConnected) this.render();
+      });
+    }
   }
 
   emitConfigChanged() {
-    this.dispatchEvent(
-      new CustomEvent("config-changed", {
-        bubbles: true,
-        composed: true,
-        detail: { config: deepClone(this._config) },
-      }),
-    );
+    this.dispatchEvent(new CustomEvent("config-changed", {
+      bubbles: true,
+      composed: true,
+      detail: { config: deepClone(this._config) },
+    }));
   }
 
   canvasState() {
@@ -655,7 +645,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
 
   updateZone(index, updater, rerender = false) {
     const zones = deepClone(this._config?.zones ?? []);
-    zones[index] = updater(zones[index]);
+    zones[index] = normalizeZone(updater(zones[index]));
     this.updateConfig({ zones }, rerender);
   }
 
@@ -685,10 +675,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
   closeDrawing() {
     if (this._draftPoints.length < 3) return;
     const zone = createZone(this._draftPoints, this._config.zones);
-    this._config = {
-      ...this._config,
-      zones: [...this._config.zones, zone],
-    };
+    this._config = { ...this._config, zones: [...this._config.zones, zone] };
     this._draftPoints = [];
     this._selectedZoneId = zone.id;
     this._selectedVertexIndex = null;
@@ -758,11 +745,39 @@ class FloorplanZoneCardEditor extends HTMLElement {
     return input;
   }
 
+  createColorInput(value, onInput) {
+    const input = document.createElement("input");
+    input.type = "color";
+    input.value = value || DEFAULT_FALLBACK_STYLE.color;
+    input.addEventListener("input", () => onInput(input.value));
+    return input;
+  }
+
+  createOpacityControl(value, onInput) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "opacity-control";
+    const input = document.createElement("input");
+    input.type = "range";
+    input.min = "0";
+    input.max = "1";
+    input.step = "0.05";
+    input.value = String(clamp01(value));
+    const output = document.createElement("span");
+    output.textContent = `${Math.round(Number(input.value) * 100)}%`;
+    input.addEventListener("input", () => {
+      output.textContent = `${Math.round(Number(input.value) * 100)}%`;
+      onInput(Number(input.value));
+    });
+    wrapper.append(input, output);
+    return wrapper;
+  }
+
   createButton(text, onClick, options = {}) {
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = text;
     if (options.kind) button.classList.add(options.kind);
+    if (options.compact) button.classList.add("compact");
     button.disabled = Boolean(options.disabled);
     button.addEventListener("click", onClick);
     return button;
@@ -773,20 +788,12 @@ class FloorplanZoneCardEditor extends HTMLElement {
       const wrapper = document.createElement("div");
       wrapper.className = "fallback-form";
       wrapper.append(
-        this.createField(
-          "Title",
-          this.createTextInput(this._config.title, "Optional title", (value) => {
-            this.updateConfig({ title: value });
-          }),
-        ),
-        this.createField(
-          "Floorplan image URL",
-          this.createTextInput(
-            typeof this._config.image === "string" ? this._config.image : "",
-            "/local/floorplan.png",
-            (value) => this.updateConfig({ image: value }),
-          ),
-        ),
+        this.createField("Title", this.createTextInput(this._config.title, "Optional title", (value) => this.updateConfig({ title: value }))),
+        this.createField("Floorplan image URL", this.createTextInput(
+          typeof this._config.image === "string" ? this._config.image : "",
+          "/local/floorplan.png",
+          (value) => this.updateConfig({ image: value }),
+        )),
       );
       return wrapper;
     }
@@ -795,23 +802,10 @@ class FloorplanZoneCardEditor extends HTMLElement {
     form.className = "native-form";
     form.hass = this._hass;
     const legacyImage = typeof this._config.image === "string" ? this._config.image : undefined;
-    form.data = {
-      title: this._config.title ?? "",
-      image: legacyImage ? undefined : this._config.image,
-    };
+    form.data = { title: this._config.title ?? "", image: legacyImage ? undefined : this._config.image };
     form.schema = [
       { name: "title", selector: { text: {} } },
-      {
-        name: "image",
-        selector: {
-          media: {
-            accept: ["image/*"],
-            image_upload: true,
-            clearable: true,
-            hide_content_type: true,
-          },
-        },
-      },
+      { name: "image", selector: { media: { accept: ["image/*"], image_upload: true, clearable: true, hide_content_type: true } } },
     ];
     form.computeLabel = (schema) => (schema.name === "title" ? "Title" : "Floorplan image");
     form.addEventListener("value-changed", (event) => {
@@ -827,82 +821,36 @@ class FloorplanZoneCardEditor extends HTMLElement {
     });
 
     if (!legacyImage) return form;
-
     const wrapper = document.createElement("div");
     wrapper.className = "native-form-wrapper";
     wrapper.append(form);
     const hint = document.createElement("p");
     hint.className = "hint";
     hint.textContent = "This card still uses a legacy image URL/path. You can keep it or replace it with the Home Assistant image picker above.";
-    const input = this.createTextInput(legacyImage, "/local/floorplan.png", (value) => {
-      this.updateConfig({ image: value });
-    });
-    wrapper.append(hint, this.createField("Legacy image URL/path", input));
+    wrapper.append(hint, this.createField("Legacy image URL/path", this.createTextInput(legacyImage, "/local/floorplan.png", (value) => this.updateConfig({ image: value }))));
     return wrapper;
   }
 
-  createZoneForm(zone, index) {
+  createZoneMetadataForm(zone, index) {
     if (!customElements.get("ha-form")) {
       const grid = document.createElement("div");
       grid.className = "grid";
-      const name = this.createTextInput(zone.name, "Zone name", (value) => {
-        this.updateZone(index, (current) => ({ ...current, name: value }));
-      });
-      const entity = this.createTextInput(zone.entity, "binary_sensor.example", (value) => {
-        this.updateZone(index, (current) => ({ ...current, entity: value }));
-      });
-      grid.append(this.createField("Name", name), this.createField("Binary sensor entity", entity));
+      grid.append(
+        this.createField("Name", this.createTextInput(zone.name, "Zone name", (value) => this.updateZone(index, (current) => ({ ...current, name: value })))),
+        this.createField("Entity", this.createTextInput(zone.entity, "sensor.example", (value) => this.updateZone(index, (current) => ({ ...current, entity: value })))),
+      );
       return grid;
     }
 
     const form = document.createElement("ha-form");
     form.className = "native-form zone-native-form";
     form.hass = this._hass;
-    form.data = {
-      name: zone.name ?? "",
-      entity: zone.entity || undefined,
-      on_color: zone.on?.color ?? DEFAULT_ON_STYLE.color,
-      off_color: zone.off?.color ?? DEFAULT_OFF_STYLE.color,
-      on_opacity: zone.on?.opacity ?? DEFAULT_ON_STYLE.opacity,
-      off_opacity: zone.off?.opacity ?? DEFAULT_OFF_STYLE.opacity,
-    };
+    form.data = { name: zone.name ?? "", entity: zone.entity || undefined };
     form.schema = [
       { name: "name", selector: { text: {} } },
-      { name: "entity", selector: { entity: { filter: { domain: "binary_sensor" } } } },
-      {
-        type: "grid",
-        name: "",
-        schema: [
-          { name: "on_color", selector: { text: { type: "color" } } },
-          { name: "off_color", selector: { text: { type: "color" } } },
-        ],
-      },
-      {
-        type: "grid",
-        name: "",
-        schema: [
-          {
-            name: "on_opacity",
-            selector: { number: { min: 0, max: 1, step: 0.05, mode: "slider" } },
-          },
-          {
-            name: "off_opacity",
-            selector: { number: { min: 0, max: 1, step: 0.05, mode: "slider" } },
-          },
-        ],
-      },
+      { name: "entity", selector: { entity: {} } },
     ];
-    form.computeLabel = (schema) => {
-      switch (schema.name) {
-        case "name": return "Name";
-        case "entity": return "Binary sensor entity";
-        case "on_color": return "ON color";
-        case "off_color": return "OFF color";
-        case "on_opacity": return "ON opacity";
-        case "off_opacity": return "OFF opacity";
-        default: return "";
-      }
-    };
+    form.computeLabel = (schema) => (schema.name === "name" ? "Name" : "Entity");
     form.addEventListener("value-changed", (event) => {
       event.stopPropagation();
       const value = event.detail?.value ?? {};
@@ -910,19 +858,109 @@ class FloorplanZoneCardEditor extends HTMLElement {
         ...current,
         name: value.name ?? "",
         entity: value.entity ?? "",
-        on: {
-          ...current.on,
-          color: value.on_color ?? DEFAULT_ON_STYLE.color,
-          opacity: Number(value.on_opacity ?? DEFAULT_ON_STYLE.opacity),
-        },
-        off: {
-          ...current.off,
-          color: value.off_color ?? DEFAULT_OFF_STYLE.color,
-          opacity: Number(value.off_opacity ?? DEFAULT_OFF_STYLE.opacity),
-        },
       }));
     });
     return form;
+  }
+
+  createStateRulesEditor(zone, zoneIndex) {
+    const section = document.createElement("div");
+    section.className = "state-rules";
+
+    const headingRow = document.createElement("div");
+    headingRow.className = "section-title";
+    const heading = document.createElement("strong");
+    heading.textContent = "State colors";
+    const add = this.createButton("Add state", () => {
+      this.updateZone(zoneIndex, (current) => ({
+        ...current,
+        states: [...(current.states ?? []), { value: "", ...DEFAULT_FALLBACK_STYLE }],
+      }), true);
+    }, { compact: true });
+    headingRow.append(heading, add);
+    section.append(headingRow);
+
+    const description = document.createElement("p");
+    description.className = "hint";
+    description.textContent = "Match the entity raw state exactly. Add as many state/color rules as needed.";
+    section.append(description);
+
+    if (!(zone.states?.length ?? 0)) {
+      const empty = document.createElement("p");
+      empty.className = "hint empty-rules";
+      empty.textContent = "No state rules yet. The fallback style will be used for every available state.";
+      section.append(empty);
+    }
+
+    (zone.states ?? []).forEach((rule, ruleIndex) => {
+      const row = document.createElement("div");
+      row.className = "state-rule-row";
+
+      const valueInput = this.createTextInput(rule.value, "State value", (value) => {
+        this.updateZone(zoneIndex, (current) => {
+          const states = deepClone(current.states ?? []);
+          states[ruleIndex] = { ...states[ruleIndex], value };
+          return { ...current, states };
+        });
+      });
+      valueInput.setAttribute("aria-label", "State value");
+
+      const colorInput = this.createColorInput(rule.color, (value) => {
+        this.updateZone(zoneIndex, (current) => {
+          const states = deepClone(current.states ?? []);
+          states[ruleIndex] = { ...states[ruleIndex], color: value };
+          return { ...current, states };
+        });
+      });
+      colorInput.setAttribute("aria-label", "State color");
+
+      const opacity = this.createOpacityControl(rule.opacity, (value) => {
+        this.updateZone(zoneIndex, (current) => {
+          const states = deepClone(current.states ?? []);
+          states[ruleIndex] = { ...states[ruleIndex], opacity: value };
+          return { ...current, states };
+        });
+      });
+
+      const remove = this.createButton("Delete", () => {
+        this.updateZone(zoneIndex, (current) => ({
+          ...current,
+          states: (current.states ?? []).filter((_, index) => index !== ruleIndex),
+        }), true);
+      }, { kind: "danger", compact: true });
+
+      row.append(valueInput, colorInput, opacity, remove);
+      section.append(row);
+    });
+
+    const styleGrid = document.createElement("div");
+    styleGrid.className = "style-grid";
+    styleGrid.append(
+      this.createStyleBox("Fallback", zone.default ?? DEFAULT_FALLBACK_STYLE, (patch) => {
+        this.updateZone(zoneIndex, (current) => ({ ...current, default: { ...current.default, ...patch } }));
+      }),
+      this.createStyleBox("Unavailable / unknown", zone.unavailable ?? DEFAULT_UNAVAILABLE_STYLE, (patch) => {
+        this.updateZone(zoneIndex, (current) => ({ ...current, unavailable: { ...current.unavailable, ...patch } }));
+      }),
+    );
+    section.append(styleGrid);
+    return section;
+  }
+
+  createStyleBox(titleText, styleValue, onChange) {
+    const box = document.createElement("div");
+    box.className = "style-box";
+    const title = document.createElement("span");
+    title.className = "style-box-title";
+    title.textContent = titleText;
+    const controls = document.createElement("div");
+    controls.className = "style-controls";
+    controls.append(
+      this.createColorInput(styleValue.color, (color) => onChange({ color })),
+      this.createOpacityControl(styleValue.opacity, (opacity) => onChange({ opacity })),
+    );
+    box.append(title, controls);
+    return box;
   }
 
   render() {
@@ -931,42 +969,39 @@ class FloorplanZoneCardEditor extends HTMLElement {
 
     const style = document.createElement("style");
     style.textContent = `
-      :host { display: block; }
-      .editor, .zones, .zone-card, .field, .preview, .fallback-form, .native-form-wrapper { display: grid; gap: 10px; }
-      .editor { gap: 18px; }
-      .field > span { color: var(--primary-text-color); font-size: 14px; font-weight: 500; }
-      input {
-        box-sizing: border-box; width: 100%; min-height: 42px; padding: 8px 12px;
-        border: 1px solid var(--divider-color, #c7c7c7); border-radius: 8px;
-        background: var(--card-background-color, #fff); color: var(--primary-text-color, #212121); font: inherit;
+      :host { display:block; }
+      .editor,.zones,.zone-card,.field,.preview,.fallback-form,.native-form-wrapper,.state-rules,.style-box { display:grid; gap:10px; }
+      .editor { gap:18px; }
+      .field > span,.style-box-title { color:var(--primary-text-color); font-size:14px; font-weight:500; }
+      input { box-sizing:border-box; width:100%; min-height:42px; padding:8px 12px; border:1px solid var(--divider-color,#c7c7c7); border-radius:8px; background:var(--card-background-color,#fff); color:var(--primary-text-color,#212121); font:inherit; }
+      input[type="color"] { width:54px; min-width:54px; padding:4px; }
+      input[type="range"] { min-height:auto; padding:0; border:0; }
+      button { min-height:40px; padding:8px 14px; border:0; border-radius:8px; background:var(--primary-color,#03a9f4); color:var(--text-primary-color,#fff); cursor:pointer; font:inherit; font-weight:500; }
+      button.compact { min-height:34px; padding:6px 10px; font-size:13px; }
+      button.secondary { background:transparent; color:var(--primary-color,#03a9f4); border:1px solid var(--primary-color,#03a9f4); }
+      button.danger { background:transparent; color:var(--error-color,#db4437); border:1px solid var(--error-color,#db4437); }
+      button:disabled { opacity:.45; cursor:default; }
+      .section-title,.toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+      .toolbar { justify-content:flex-start; flex-wrap:wrap; }
+      .mode-status { padding:8px 10px; border-radius:8px; background:var(--secondary-background-color,#eee); color:var(--secondary-text-color,#727272); font-size:13px; }
+      .zone-card { padding:12px; border:1px solid var(--divider-color,#d0d0d0); border-radius:10px; gap:14px; }
+      .zone-card.selected { border-color:var(--primary-color,#03a9f4); box-shadow:inset 0 0 0 1px var(--primary-color,#03a9f4); }
+      .native-form { display:block; }
+      .zone-native-form { margin-top:4px; }
+      .grid,.style-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+      .state-rules { padding-top:4px; border-top:1px solid var(--divider-color,#ddd); }
+      .state-rule-row { display:grid; grid-template-columns:minmax(110px,1fr) 54px minmax(140px,1fr) auto; gap:10px; align-items:center; }
+      .opacity-control { display:grid; grid-template-columns:minmax(90px,1fr) 42px; gap:8px; align-items:center; }
+      .opacity-control > span { color:var(--secondary-text-color,#727272); font-size:12px; text-align:right; }
+      .style-box { padding:10px; border:1px solid var(--divider-color,#ddd); border-radius:8px; }
+      .style-controls { display:grid; grid-template-columns:54px minmax(140px,1fr); gap:10px; align-items:center; }
+      .hint { margin:0; color:var(--secondary-text-color,#727272); font-size:13px; line-height:1.45; }
+      .empty-rules { font-style:italic; }
+      @media (max-width:700px) {
+        .grid,.style-grid { grid-template-columns:1fr; }
+        .state-rule-row { grid-template-columns:minmax(0,1fr) 54px; }
+        .state-rule-row .opacity-control { grid-column:1/-1; }
       }
-      button {
-        min-height: 40px; padding: 8px 14px; border: 0; border-radius: 8px;
-        background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff);
-        cursor: pointer; font: inherit; font-weight: 500;
-      }
-      button.secondary {
-        background: transparent; color: var(--primary-color, #03a9f4);
-        border: 1px solid var(--primary-color, #03a9f4);
-      }
-      button.danger {
-        background: transparent; color: var(--error-color, #db4437);
-        border: 1px solid var(--error-color, #db4437);
-      }
-      button:disabled { opacity: 0.45; cursor: default; }
-      .section-title, .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-      .toolbar { justify-content: flex-start; flex-wrap: wrap; }
-      .mode-status {
-        padding: 8px 10px; border-radius: 8px; background: var(--secondary-background-color, #eee);
-        color: var(--secondary-text-color, #727272); font-size: 13px;
-      }
-      .zone-card { padding: 12px; border: 1px solid var(--divider-color, #d0d0d0); border-radius: 10px; }
-      .zone-card.selected { border-color: var(--primary-color, #03a9f4); box-shadow: inset 0 0 0 1px var(--primary-color, #03a9f4); }
-      .native-form { display: block; }
-      .zone-native-form { margin-top: 4px; }
-      .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-      .hint { margin: 0; color: var(--secondary-text-color, #727272); font-size: 13px; line-height: 1.45; }
-      @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
     `;
 
     const editor = document.createElement("div");
@@ -1001,50 +1036,30 @@ class FloorplanZoneCardEditor extends HTMLElement {
       this.render();
     });
     canvas.addEventListener("floorplan-draw-close", () => this.closeDrawing());
-    canvas.addEventListener("floorplan-vertex-commit", (event) => {
-      this.commitVertices(event.detail.zoneId, event.detail.points, event.detail.vertexIndex);
-    });
-    canvas.addEventListener("floorplan-vertex-insert", (event) => {
-      this.insertVertex(event.detail.zoneId, event.detail.afterIndex, event.detail.point);
-    });
+    canvas.addEventListener("floorplan-vertex-commit", (event) => this.commitVertices(event.detail.zoneId, event.detail.points, event.detail.vertexIndex));
+    canvas.addEventListener("floorplan-vertex-insert", (event) => this.insertVertex(event.detail.zoneId, event.detail.afterIndex, event.detail.point));
     preview.append(previewTitle, canvas);
 
     const toolbar = document.createElement("div");
     toolbar.className = "toolbar";
     if (this._mode === "draw") {
       toolbar.append(
-        this.createButton(
-          "Undo point",
-          () => {
-            this._draftPoints = this._draftPoints.slice(0, -1);
-            this.render();
-          },
-          { kind: "secondary", disabled: this._draftPoints.length === 0 },
-        ),
-        this.createButton("Close polygon", () => this.closeDrawing(), {
-          disabled: this._draftPoints.length < 3,
-        }),
+        this.createButton("Undo point", () => { this._draftPoints = this._draftPoints.slice(0, -1); this.render(); }, { kind: "secondary", disabled: this._draftPoints.length === 0 }),
+        this.createButton("Close polygon", () => this.closeDrawing(), { disabled: this._draftPoints.length < 3 }),
         this.createButton("Cancel", () => this.cancelDrawing(), { kind: "danger" }),
       );
     } else if (this._mode === "edit") {
       const zone = this._config.zones.find((item) => item.id === this._selectedZoneId);
       toolbar.append(
-        this.createButton(
-          "Done editing",
-          () => {
-            this._mode = "select";
-            this._selectedZoneId = null;
-            this._selectedVertexIndex = null;
-            this.render();
-          },
-          { kind: "secondary" },
-        ),
+        this.createButton("Done editing", () => {
+          this._mode = "select";
+          this._selectedZoneId = null;
+          this._selectedVertexIndex = null;
+          this.render();
+        }, { kind: "secondary" }),
         this.createButton("Delete vertex", () => this.deleteSelectedVertex(), {
           kind: "danger",
-          disabled:
-            this._selectedVertexIndex === null ||
-            !zone ||
-            (zone.points?.length ?? 0) <= 3,
+          disabled: this._selectedVertexIndex === null || !zone || (zone.points?.length ?? 0) <= 3,
         }),
       );
     }
@@ -1064,9 +1079,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
     zoneTitle.className = "section-title";
     const heading = document.createElement("strong");
     heading.textContent = "Zones";
-    const add = this.createButton("Add zone", () => this.startDrawing(), {
-      disabled: this._mode === "draw",
-    });
+    const add = this.createButton("Add zone", () => this.startDrawing(), { disabled: this._mode === "draw" });
     zoneTitle.append(heading, add);
     zones.append(zoneTitle);
 
@@ -1088,26 +1101,26 @@ class FloorplanZoneCardEditor extends HTMLElement {
       name.textContent = zone.name || `Zone ${index + 1}`;
       const actions = document.createElement("div");
       actions.className = "toolbar";
-      const edit = this.createButton("Edit shape", () => this.selectZone(zone.id), { kind: "secondary" });
-      const remove = this.createButton(
-        "Delete",
-        () => {
+      actions.append(
+        this.createButton("Edit shape", () => this.selectZone(zone.id), { kind: "secondary" }),
+        this.createButton("Delete", () => {
           if (this._selectedZoneId === zone.id) {
             this._selectedZoneId = null;
             this._selectedVertexIndex = null;
             this._mode = "select";
           }
           this.updateConfig({ zones: this._config.zones.filter((_, i) => i !== index) }, true);
-        },
-        { kind: "danger" },
+        }, { kind: "danger" }),
       );
-      actions.append(edit, remove);
       header.append(name, actions);
-      zoneCard.append(header, this.createZoneForm(zone, index));
+      zoneCard.append(header, this.createZoneMetadataForm(zone, index), this.createStateRulesEditor(zone, index));
 
       const hint = document.createElement("p");
       hint.className = "hint";
-      hint.textContent = "The entity picker is limited to binary_sensor entities. Shape coordinates remain normalized and are saved only after pointer release.";
+      const currentState = entityRawState(this._hass, zone.entity);
+      hint.textContent = zone.entity
+        ? `Current raw state: ${currentState ?? "not available"}. Exact state rules are evaluated before the fallback style.`
+        : "Choose any Home Assistant entity, then associate each raw state value with a color and opacity.";
       zoneCard.append(hint);
       zones.append(zoneCard);
     }
