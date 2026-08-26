@@ -1,6 +1,6 @@
 # Floorplan Zone Card
 
-A Home Assistant custom dashboard card for displaying a floorplan with polygon zones driven by entity state and standard Home Assistant actions.
+A Home Assistant custom dashboard card for displaying a zoomable floorplan with polygon zones driven by entity state.
 
 ![Floorplan Zone Card preview](images/preview.svg)
 
@@ -11,11 +11,12 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 3. draw the zone directly on the floorplan;
 4. select any Home Assistant entity;
 5. add as many exact state → color/opacity rules as needed;
-6. optionally configure tap, hold, and double-tap actions;
-7. save the card in the normal Home Assistant dashboard editor.
+6. optionally configure Home Assistant actions for the zone;
+7. zoom and pan the floorplan while keeping every zone aligned;
+8. save the card in the normal Home Assistant dashboard editor.
 
 > [!IMPORTANT]
-> This repository is in active early development. The editor supports Home Assistant-native image/media, entity and action selectors, graphical polygon editing, and unlimited exact-state styling rules per zone.
+> This repository is in active early development. The editor supports Home Assistant-native image/media, entity and action selectors, graphical polygon editing, unlimited exact-state styling rules, per-zone interactions, and synchronized floorplan zoom/pan.
 
 ## Current development scope
 
@@ -27,9 +28,11 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Unlimited exact raw-state color/opacity rules per zone.
 - Separate fallback and unavailable/unknown styles.
 - Backward-compatible migration of legacy binary `on` / `off` zone styles.
-- Native Home Assistant `tap_action`, `hold_action`, and `double_tap_action` per zone.
-- Standard `hass-action` dispatch for Lovelace actions.
-- Keyboard activation for actionable zones with Enter/Space.
+- Per-zone `tap_action`, `hold_action`, and `double_tap_action` using Home Assistant's standard action model.
+- Standard `hass-action` dispatch for `more-info`, `toggle`, `perform-action`, `navigate`, `url`, `assist`, confirmation and other supported actions.
+- Synchronized image + SVG zoom from `1x` to `5x`, with controls, mouse wheel and pinch gestures.
+- Pan while zoomed by dragging empty floorplan space; dragging an actionable zone cancels its action and pans instead.
+- Zoom state is UI-only and never changes the normalized polygon coordinates stored in the card configuration.
 - Responsive image + SVG overlay renderer.
 - Resolution of `media-source://` images through Home Assistant before rendering.
 - Normalized polygon coordinates (`0..1`) so zones remain aligned while resizing.
@@ -40,50 +43,9 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Vertex updates committed only on pointer release.
 - HACS-compatible `dist/ha-floorplan-zone-card.js` output.
 
-## Zone actions
-
-Each zone can use Home Assistant's normal Lovelace action model:
-
-```yaml
-tap_action:
-  action: more-info
-hold_action:
-  action: none
-double_tap_action:
-  action: none
-```
-
-The visual editor uses Home Assistant's native `ui_action` selector, so actions such as `more-info`, `toggle`, `perform-action`, `navigate`, `url`, `assist`, `none`, confirmations, targets and action data can be configured using the standard Home Assistant UI.
-
-A zone can therefore toggle its linked entity:
-
-```yaml
-entity: light.workshop
-tap_action:
-  action: toggle
-hold_action:
-  action: more-info
-```
-
-or execute a Home Assistant action independently from the entity used for its color:
-
-```yaml
-entity: sensor.machine_state
-tap_action:
-  action: perform-action
-  perform_action: script.machine_reset
-  confirmation: true
-```
-
-Actions are executed only in the normal dashboard view. They are disabled while the polygon editor is drawing or editing zone geometry.
-
-For compatibility, an existing zone with an entity and no explicit `tap_action` behaves as `more-info`. Newly drawn zones start with `more-info` on tap and `none` for hold/double tap.
-
 ## State color rules
 
 Each zone can use any Home Assistant entity. Rules compare against the entity's **raw state** (`hass.states[entity_id].state`) using exact string matching.
-
-For example, a machine-state sensor can map an arbitrary number of values:
 
 ```yaml
 entity: sensor.machine_state
@@ -118,6 +80,44 @@ The visual editor provides **Add state** and **Delete** controls and does not im
 
 Newly drawn zones start with `off` and `on` rules as a convenience for binary entities, but they can be edited, removed, or replaced with any values.
 
+## Zone actions
+
+Every zone can use the standard Home Assistant interaction model:
+
+```yaml
+tap_action:
+  action: toggle
+hold_action:
+  action: more-info
+double_tap_action:
+  action: perform-action
+  perform_action: script.machine_reset
+  confirmation: true
+```
+
+The graphical editor uses Home Assistant's native `ui_action` selector, so action-specific fields such as targets, data, navigation paths, URLs, Assist options and confirmations are handled by Home Assistant itself.
+
+If a zone has an entity and no explicit `tap_action`, tapping it defaults to `more-info`. Hold and double tap default to `none`.
+
+Actions are only active on the normal dashboard. While the floorplan is being edited, pointer interaction is reserved for selecting zones and moving/inserting vertices and never triggers zone actions.
+
+## Zoom and pan
+
+Zoom is applied to a single transform layer containing both the floorplan image and the SVG zone overlay. The polygon coordinates are **not recalculated or rewritten**, so a zone remains aligned at every zoom level.
+
+Available controls:
+
+- **+ / −** buttons in the top-right corner;
+- mouse wheel zoom centered on the pointer;
+- pinch-to-zoom on touch devices;
+- drag empty floorplan space to pan when zoomed;
+- drag an actionable zone to pan instead of triggering its action;
+- **↺ Reset** to return to `100%`.
+
+The zoom range is currently fixed at `1x` to `5x` with `0.25x` button/wheel steps. Zoom and pan are intentionally **ephemeral UI state**: they are preserved while the card/editor rerenders, but they are not written to YAML and do not modify `points`.
+
+The editor uses the same zoom model, making it possible to zoom into a small area before moving or inserting polygon vertices.
+
 ## Backward compatibility
 
 Legacy binary configurations remain supported. Existing zones like:
@@ -131,23 +131,11 @@ off:
   opacity: 0.08
 ```
 
-are normalized internally to:
-
-```yaml
-states:
-  - value: "off"
-    color: "#808080"
-    opacity: 0.08
-  - value: "on"
-    color: "#ff3b30"
-    opacity: 0.55
-```
-
-No manual migration is required.
+are normalized internally to `states` rules. No manual migration is required.
 
 ## Example configuration
 
-The visual editor writes this configuration automatically. A floorplan selected or uploaded with Home Assistant is stored as a media reference:
+The visual editor writes this configuration automatically:
 
 ```yaml
 type: custom:floorplan-zone-card
@@ -167,12 +155,6 @@ zones:
         y: 0.8
       - x: 0.2
         y: 0.8
-    tap_action:
-      action: more-info
-    hold_action:
-      action: none
-    double_tap_action:
-      action: none
     states:
       - value: "idle"
         color: "#808080"
@@ -189,6 +171,11 @@ zones:
     unavailable:
       color: "#9e9e9e"
       opacity: 0.20
+    tap_action:
+      action: more-info
+    hold_action:
+      action: perform-action
+      perform_action: script.machine_details
 ```
 
 Existing configurations using a direct URL or Home Assistant `/local/` path remain supported:
@@ -196,8 +183,6 @@ Existing configurations using a direct URL or Home Assistant `/local/` path rema
 ```yaml
 image: /local/floorplan.png
 ```
-
-They can be kept as-is or replaced later from the visual editor with the native image picker.
 
 ## Shape editing
 
@@ -208,7 +193,7 @@ When a zone is in **Edit shape** mode:
 - the last moved/inserted vertex becomes selected;
 - use **Delete vertex** to remove it when the polygon has more than three points;
 - coordinates are saved only when the pointer is released;
-- configured zone actions are not executed while editing.
+- zoom with the controls, wheel, or pinch and drag empty space to pan without changing the saved coordinates.
 
 ## Development
 
@@ -253,7 +238,11 @@ dist/ha-floorplan-zone-card.js
 - [x] Native unrestricted entity selector
 - [x] Unlimited exact-state color/opacity rules
 - [x] Fallback and unavailable styles
-- [x] Native zone tap/hold/double-tap actions
+- [x] Native Home Assistant zone action selectors
+- [x] Runtime tap / hold / double tap actions
+- [x] Synchronized image + zone zoom controls
+- [x] Mouse-wheel and pinch zoom
+- [x] Pan while zoomed without rewriting polygon coordinates
 - [ ] Undo/redo for saved shape edits
 - [ ] Mobile editor polish
 - [ ] Runtime UX testing on a real Home Assistant dashboard
