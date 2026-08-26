@@ -2,7 +2,7 @@ const CARD_TYPE = "floorplan-zone-card";
 const CARD_TAG = "floorplan-zone-card";
 const EDITOR_TAG = "floorplan-zone-card-editor";
 const CANVAS_TAG = "floorplan-zone-canvas";
-const VERSION = "0.1.0-dev.5";
+const VERSION = "0.1.0-dev.6";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const SVG_SIZE = 1000;
 
@@ -20,6 +20,10 @@ const HOLD_DELAY = 500;
 const DOUBLE_TAP_DELAY = 280;
 const GESTURE_MOVE_THRESHOLD = 12;
 const PAN_MOVE_THRESHOLD = 4;
+const AUTO_ZOOM_PADDING = 0.12;
+const AUTO_ZOOM_TRANSITION_MS = 360;
+const MIN_FOCUS_AREA_SIZE = 0.01;
+const AUTO_ZOOM_EXIT_BEHAVIORS = new Set(["previous", "reset", "keep"]);
 
 function deepClone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -67,6 +71,81 @@ function normalizeViewState(state) {
   };
 }
 
+function normalizeFocusArea(area) {
+  const x = clamp01(area?.x ?? 0.25);
+  const y = clamp01(area?.y ?? 0.25);
+  const width = clamp(area?.width ?? 0.5, 0, 1 - x);
+  const height = clamp(area?.height ?? 0.5, 0, 1 - y);
+  return { x, y, width, height };
+}
+
+function focusAreaValid(area) {
+  if (!area || typeof area !== "object" || Array.isArray(area)) return false;
+  const normalized = normalizeFocusArea(area);
+  return normalized.width >= MIN_FOCUS_AREA_SIZE && normalized.height >= MIN_FOCUS_AREA_SIZE;
+}
+
+function normalizeAutoZoomRule(rule) {
+  const target = rule?.target === "area" ? "area" : "zone";
+  const exitBehavior = AUTO_ZOOM_EXIT_BEHAVIORS.has(rule?.exit_behavior)
+    ? rule.exit_behavior
+    : "previous";
+  return {
+    ...rule,
+    entity: typeof rule?.entity === "string" ? rule.entity : "",
+    state: rule?.state === undefined || rule?.state === null ? "" : String(rule.state),
+    target,
+    zone_id: typeof rule?.zone_id === "string" ? rule.zone_id : "",
+    area: focusAreaValid(rule?.area) ? normalizeFocusArea(rule.area) : undefined,
+    exit_behavior: exitBehavior,
+  };
+}
+
+function zoneFocusArea(zone) {
+  if (!Array.isArray(zone?.points) || zone.points.length < 3) return null;
+  const xs = zone.points.map((point) => clamp01(point.x));
+  const ys = zone.points.map((point) => clamp01(point.y));
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const area = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+  return focusAreaValid(area) ? area : null;
+}
+
+function autoZoomTargetArea(config, rule) {
+  if (!rule) return null;
+  if (rule.target === "area") {
+    return focusAreaValid(rule.area) ? normalizeFocusArea(rule.area) : null;
+  }
+  const zone = (config?.zones ?? []).find((item) => item.id === rule.zone_id);
+  return zoneFocusArea(zone);
+}
+
+function viewForFocusArea(area, padding = AUTO_ZOOM_PADDING) {
+  const normalized = normalizeFocusArea(area);
+  if (!focusAreaValid(normalized)) return normalizeViewState();
+  const width = clamp(normalized.width * (1 + padding * 2), MIN_FOCUS_AREA_SIZE, 1);
+  const height = clamp(normalized.height * (1 + padding * 2), MIN_FOCUS_AREA_SIZE, 1);
+  const scale = clamp(Math.min(1 / width, 1 / height), MIN_ZOOM, MAX_ZOOM);
+  return normalizeViewState({
+    scale,
+    centerX: normalized.x + normalized.width / 2,
+    centerY: normalized.y + normalized.height / 2,
+  });
+}
+
+function matchingAutoZoomRule(config, hass) {
+  const rules = config?.auto_zoom ?? [];
+  for (let index = 0; index < rules.length; index += 1) {
+    const rule = rules[index];
+    if (!rule?.entity || entityRawState(hass, rule.entity) !== rule.state) continue;
+    const area = autoZoomTargetArea(config, rule);
+    if (area) return { index, rule, area };
+  }
+  return null;
+}
+
 function legacyStateRules(zone) {
   const rules = [];
   if (zone?.off) rules.push({ value: "off", ...normalizeStyle(zone.off, DEFAULT_OFF_STYLE) });
@@ -103,6 +182,9 @@ function normalizedConfig(config) {
   return {
     ...clone,
     zones: Array.isArray(clone.zones) ? clone.zones.map(normalizeZone) : [],
+    auto_zoom: Array.isArray(clone.auto_zoom)
+      ? clone.auto_zoom.map(normalizeAutoZoomRule)
+      : [],
   };
 }
 
@@ -225,9 +307,11 @@ class FloorplanZoneCanvas extends HTMLElement {
       selectedZoneId: null,
       selectedVertexIndex: null,
       draftPoints: [],
+      focusArea: null,
     };
     this._view = normalizeViewState();
     this._drag = null;
+    this._focusAreaDrag = null;
     this._backgroundPan = null;
     this._actionGesture = null;
     this._pendingTap = null;
@@ -238,6 +322,7 @@ class FloorplanZoneCanvas extends HTMLElement {
     this._imageKey = null;
     this._resolvedImage = "";
     this._imageResolveToken = 0;
+    this._viewTransitionTimer = null;
     this._resizeObserver = typeof ResizeObserver !== "undefined"
       ? new ResizeObserver(() => this.applyCurrentView())
       : null;
@@ -272,6 +357,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       draftPoints: Array.isArray(state?.draftPoints)
         ? state.draftPoints.map(normalizePoint)
         : [],
+      focusArea: state?.focusArea ? normalizeFocusArea(state.focusArea) : null,
     };
     this.render();
   }
@@ -295,10 +381,13 @@ class FloorplanZoneCanvas extends HTMLElement {
     this.clearActionGesture();
     this.clearPendingTap();
     this._backgroundPan = null;
+    this._focusAreaDrag = null;
     this._touchPointers.clear();
     this._pinch = null;
     if (this._clickSuppressTimer) clearTimeout(this._clickSuppressTimer);
     this._clickSuppressTimer = null;
+    if (this._viewTransitionTimer) clearTimeout(this._viewTransitionTimer);
+    this._viewTransitionTimer = null;
   }
 
   suppressClicksFor(delay = 120) {
@@ -390,6 +479,7 @@ class FloorplanZoneCanvas extends HTMLElement {
   }
 
   setZoomAt(clientX, clientY, nextScale, emit = true) {
+    this.stopViewAnimation();
     const metrics = this.viewMetrics();
     if (!metrics) return;
     const scale = clamp(nextScale, MIN_ZOOM, MAX_ZOOM);
@@ -416,12 +506,39 @@ class FloorplanZoneCanvas extends HTMLElement {
   }
 
   resetView() {
+    this.stopViewAnimation();
     this._view = normalizeViewState();
     this.applyCurrentView();
     this.emitViewChanged();
   }
 
+  stopViewAnimation() {
+    if (this._viewTransitionTimer) clearTimeout(this._viewTransitionTimer);
+    this._viewTransitionTimer = null;
+    this.viewElements().transform?.classList.remove("view-animated");
+  }
+
+  animateToView(state, emit = true) {
+    this.stopViewAnimation();
+    this._view = normalizeViewState(state);
+    const transform = this.viewElements().transform;
+    transform?.classList.add("view-animated");
+    this.applyCurrentView();
+    if (emit) this.emitViewChanged();
+    this._viewTransitionTimer = setTimeout(() => {
+      this.viewElements().transform?.classList.remove("view-animated");
+      this._viewTransitionTimer = null;
+    }, AUTO_ZOOM_TRANSITION_MS + 80);
+  }
+
+  focusArea(area, emit = true) {
+    if (!focusAreaValid(area)) return false;
+    this.animateToView(viewForFocusArea(area), emit);
+    return true;
+  }
+
   setViewCenterFromPan(startView, startX, startY, clientX, clientY) {
+    this.stopViewAnimation();
     const metrics = this.viewMetrics();
     if (!metrics || startView.scale <= MIN_ZOOM) return;
     this._view = normalizeViewState({
@@ -478,8 +595,24 @@ class FloorplanZoneCanvas extends HTMLElement {
     };
     const distance = Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
     if (!distance) return;
+    this.stopViewAnimation();
     this.clearActionGesture();
     this._backgroundPan = null;
+    if (this._focusAreaDrag) {
+      const drag = this._focusAreaDrag;
+      const area = this._editorState.focusArea;
+      if (focusAreaValid(area)) {
+        drag.rect.setAttribute("x", String(area.x * SVG_SIZE));
+        drag.rect.setAttribute("y", String(area.y * SVG_SIZE));
+        drag.rect.setAttribute("width", String(area.width * SVG_SIZE));
+        drag.rect.setAttribute("height", String(area.height * SVG_SIZE));
+      } else {
+        drag.rect.setAttribute("width", "0");
+        drag.rect.setAttribute("height", "0");
+      }
+      drag.rect.classList.remove("drawing");
+      this._focusAreaDrag = null;
+    }
     this.cancelVertexDragGeometry();
     this.clearPendingTap();
     this._pinch = {
@@ -732,6 +865,66 @@ class FloorplanZoneCanvas extends HTMLElement {
     return gesture.panned;
   }
 
+  startFocusAreaDrag(event, svg, rect) {
+    if (this._pinch) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const start = this.pointerPoint(event, svg);
+    this._focusAreaDrag = {
+      pointerId: event.pointerId,
+      start,
+      rect,
+      svg,
+    };
+    rect.setAttribute("x", String(start.x * SVG_SIZE));
+    rect.setAttribute("y", String(start.y * SVG_SIZE));
+    rect.setAttribute("width", "0");
+    rect.setAttribute("height", "0");
+    rect.classList.add("drawing");
+    try {
+      svg.setPointerCapture(event.pointerId);
+    } catch (_error) {
+      // Pointer capture is optional.
+    }
+  }
+
+  updateFocusAreaDrag(event) {
+    const drag = this._focusAreaDrag;
+    if (!drag || drag.pointerId !== event.pointerId || this._pinch) return;
+    event.preventDefault();
+    const point = this.pointerPoint(event, drag.svg);
+    const x = Math.min(drag.start.x, point.x);
+    const y = Math.min(drag.start.y, point.y);
+    const width = Math.abs(point.x - drag.start.x);
+    const height = Math.abs(point.y - drag.start.y);
+    drag.area = normalizeFocusArea({ x, y, width, height });
+    drag.rect.setAttribute("x", String(x * SVG_SIZE));
+    drag.rect.setAttribute("y", String(y * SVG_SIZE));
+    drag.rect.setAttribute("width", String(width * SVG_SIZE));
+    drag.rect.setAttribute("height", String(height * SVG_SIZE));
+  }
+
+  finishFocusAreaDrag(event, cancelled = false) {
+    const drag = this._focusAreaDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    try {
+      drag.svg.releasePointerCapture(event.pointerId);
+    } catch (_error) {
+      // Pointer capture is optional.
+    }
+    this._focusAreaDrag = null;
+    drag.rect.classList.remove("drawing");
+    if (cancelled || this._pinch || !focusAreaValid(drag.area)) {
+      this.render();
+      return;
+    }
+    this.dispatchEditorEvent("floorplan-focus-area-commit", {
+      area: normalizeFocusArea(drag.area),
+    });
+  }
+
   pointerPoint(event, svg) {
     const rect = svg.getBoundingClientRect();
     if (!rect.width || !rect.height) return { x: 0, y: 0 };
@@ -819,6 +1012,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       selectedZoneId,
       selectedVertexIndex,
       draftPoints,
+      focusArea,
     } = this._editorState;
     const imageConfigured = Boolean(imageContentId(this._config?.image));
 
@@ -827,6 +1021,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       :host { display:block; }
       .canvas { position:relative; overflow:hidden; border-radius:var(--ha-card-border-radius,12px); background:var(--secondary-background-color,#eee); touch-action:none; }
       .transform-layer { position:relative; width:100%; will-change:transform; }
+      .transform-layer.view-animated { transition:transform ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1); }
       .transform-layer.empty { aspect-ratio:16/9; min-height:220px; }
       img { display:block; width:100%; height:auto; user-select:none; pointer-events:none; }
       svg { position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
@@ -838,6 +1033,8 @@ class FloorplanZoneCanvas extends HTMLElement {
       polygon.selected { stroke:var(--primary-color,#03a9f4)!important; stroke-width:4!important; }
       .draft-line { fill:none; stroke:var(--primary-color,#03a9f4); stroke-width:4; vector-effect:non-scaling-stroke; pointer-events:none; }
       .draft-point,.vertex { fill:var(--primary-color,#03a9f4); stroke:var(--card-background-color,#fff); stroke-width:3; vector-effect:non-scaling-stroke; }
+      .focus-area { fill:color-mix(in srgb,var(--primary-color,#03a9f4) 18%,transparent); stroke:var(--primary-color,#03a9f4); stroke-width:3; stroke-dasharray:14 10; vector-effect:non-scaling-stroke; pointer-events:none; }
+      .focus-area.drawing { fill:color-mix(in srgb,var(--primary-color,#03a9f4) 28%,transparent); }
       .vertex.selected-vertex { fill:var(--warning-color,#ff9800); stroke-width:5; }
       .midpoint { fill:var(--card-background-color,#fff); stroke:var(--primary-color,#03a9f4); stroke-width:3; vector-effect:non-scaling-stroke; cursor:copy; }
       .draft-point { pointer-events:none; }
@@ -904,7 +1101,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       polygon.setAttribute("stroke", zone.stroke?.color ?? "transparent");
       polygon.setAttribute("stroke-width", String(zone.stroke?.width ?? 0));
 
-      if (interactive && mode !== "draw") {
+      if (interactive && mode !== "draw" && mode !== "focus-area") {
         polygon.classList.add("selectable");
         polygon.addEventListener("click", (event) => {
           event.stopPropagation();
@@ -1000,6 +1197,35 @@ class FloorplanZoneCanvas extends HTMLElement {
       }
     }
 
+    if (interactive && mode === "focus-area") {
+      const area = focusArea ? normalizeFocusArea(focusArea) : null;
+      const rect = document.createElementNS(SVG_NS, "rect");
+      rect.classList.add("focus-area");
+      if (area && focusAreaValid(area)) {
+        rect.setAttribute("x", String(area.x * SVG_SIZE));
+        rect.setAttribute("y", String(area.y * SVG_SIZE));
+        rect.setAttribute("width", String(area.width * SVG_SIZE));
+        rect.setAttribute("height", String(area.height * SVG_SIZE));
+      } else {
+        rect.setAttribute("x", "0");
+        rect.setAttribute("y", "0");
+        rect.setAttribute("width", "0");
+        rect.setAttribute("height", "0");
+      }
+      svg.append(rect);
+      svg.addEventListener("pointerdown", (event) => {
+        if (event.target !== svg) return;
+        this.startFocusAreaDrag(event, svg, rect);
+      });
+      svg.addEventListener("pointermove", (event) => this.updateFocusAreaDrag(event));
+      svg.addEventListener("pointerup", (event) => this.finishFocusAreaDrag(event, false));
+      svg.addEventListener("pointercancel", (event) => this.finishFocusAreaDrag(event, true));
+      const hint = document.createElement("div");
+      hint.className = "draw-hint";
+      hint.textContent = "Drag a rectangle over the area to focus · wheel/pinch zoom remains available";
+      container.append(hint);
+    }
+
     if (interactive && mode === "draw") {
       if (draftPoints.length >= 2) {
         const line = document.createElementNS(SVG_NS, "polyline");
@@ -1040,7 +1266,7 @@ class FloorplanZoneCanvas extends HTMLElement {
     }
 
     svg.addEventListener("pointerdown", (event) => {
-      if (event.target !== svg) return;
+      if (mode === "focus-area" || event.target !== svg) return;
       this.beginBackgroundPan(event, svg);
     });
     svg.addEventListener("pointermove", (event) => {
@@ -1137,6 +1363,8 @@ class FloorplanZoneCard extends HTMLElement {
     this._config = undefined;
     this._hass = undefined;
     this._viewState = normalizeViewState();
+    this._activeAutoZoomIndex = null;
+    this._autoZoomRestoreView = null;
   }
 
   static getConfigElement() {
@@ -1152,13 +1380,47 @@ class FloorplanZoneCard extends HTMLElement {
       throw new Error("Invalid Floorplan Zone Card configuration.");
     }
     this._config = normalizedConfig(config);
+    this._activeAutoZoomIndex = null;
+    this._autoZoomRestoreView = null;
     this.render();
   }
 
   set hass(hass) {
     this._hass = hass;
     const canvas = this.shadowRoot?.querySelector(CANVAS_TAG);
-    if (canvas) canvas.hass = hass;
+    if (canvas) {
+      canvas.hass = hass;
+      this.evaluateAutoZoom(canvas);
+    }
+  }
+
+  evaluateAutoZoom(canvas) {
+    if (!canvas || !this._config || !this._hass) return;
+    const match = matchingAutoZoomRule(this._config, this._hass);
+    const previousIndex = this._activeAutoZoomIndex;
+
+    if (match && previousIndex === match.index) return;
+
+    if (match) {
+      if (previousIndex === null) {
+        this._autoZoomRestoreView = deepClone(this._viewState);
+      }
+      this._activeAutoZoomIndex = match.index;
+      canvas.focusArea(match.area);
+      return;
+    }
+
+    if (previousIndex === null) return;
+    const previousRule = this._config.auto_zoom?.[previousIndex];
+    const exitBehavior = previousRule?.exit_behavior ?? "previous";
+    this._activeAutoZoomIndex = null;
+
+    if (exitBehavior === "previous" && this._autoZoomRestoreView) {
+      canvas.animateToView(this._autoZoomRestoreView);
+    } else if (exitBehavior === "reset") {
+      canvas.animateToView(normalizeViewState());
+    }
+    this._autoZoomRestoreView = null;
   }
 
   get hass() {
@@ -1203,6 +1465,9 @@ class FloorplanZoneCard extends HTMLElement {
     content.append(canvas);
     card.append(content);
     this.shadowRoot.append(style, card);
+    if (this._hass) {
+      requestAnimationFrame(() => this.evaluateAutoZoom(canvas));
+    }
   }
 }
 
@@ -1216,6 +1481,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
     this._selectedZoneId = null;
     this._selectedVertexIndex = null;
     this._draftPoints = [];
+    this._focusRuleIndex = null;
     this._viewState = normalizeViewState();
     this._haFormReadyListener = null;
   }
@@ -1232,6 +1498,13 @@ class FloorplanZoneCardEditor extends HTMLElement {
       this._selectedVertexIndex >= selectedZone.points.length
     ) {
       this._selectedVertexIndex = null;
+    }
+    if (
+      this._focusRuleIndex !== null &&
+      !this._config.auto_zoom?.[this._focusRuleIndex]
+    ) {
+      this._focusRuleIndex = null;
+      if (this._mode === "focus-area") this._mode = "select";
     }
     this.render();
   }
@@ -1274,6 +1547,9 @@ class FloorplanZoneCardEditor extends HTMLElement {
       selectedZoneId: this._selectedZoneId,
       selectedVertexIndex: this._selectedVertexIndex,
       draftPoints: this._draftPoints,
+      focusArea: this._focusRuleIndex === null
+        ? null
+        : this._config?.auto_zoom?.[this._focusRuleIndex]?.area ?? null,
     };
   }
 
@@ -1306,10 +1582,79 @@ class FloorplanZoneCardEditor extends HTMLElement {
     this.updateConfig({ zones }, rerender);
   }
 
+  updateAutoZoomRule(index, updater, rerender = false) {
+    const rules = deepClone(this._config?.auto_zoom ?? []);
+    if (!rules[index]) return;
+    rules[index] = normalizeAutoZoomRule(updater(rules[index]));
+    this.updateConfig({ auto_zoom: rules }, rerender);
+  }
+
+  addAutoZoomRule() {
+    const defaultZoneId = this._config?.zones?.[0]?.id ?? "";
+    const rule = normalizeAutoZoomRule({
+      entity: "",
+      state: "on",
+      target: defaultZoneId ? "zone" : "area",
+      zone_id: defaultZoneId,
+      exit_behavior: "previous",
+    });
+    this.updateConfig({ auto_zoom: [...(this._config.auto_zoom ?? []), rule] }, true);
+  }
+
+  moveAutoZoomRule(index, delta) {
+    const rules = deepClone(this._config?.auto_zoom ?? []);
+    const targetIndex = index + delta;
+    if (index < 0 || index >= rules.length || targetIndex < 0 || targetIndex >= rules.length) return;
+    [rules[index], rules[targetIndex]] = [rules[targetIndex], rules[index]];
+    if (this._focusRuleIndex === index) this._focusRuleIndex = targetIndex;
+    else if (this._focusRuleIndex === targetIndex) this._focusRuleIndex = index;
+    this.updateConfig({ auto_zoom: rules }, true);
+  }
+
+  deleteAutoZoomRule(index) {
+    const rules = (this._config?.auto_zoom ?? []).filter((_, ruleIndex) => ruleIndex !== index);
+    if (this._focusRuleIndex === index) {
+      this._focusRuleIndex = null;
+      this._mode = "select";
+    } else if (this._focusRuleIndex !== null && this._focusRuleIndex > index) {
+      this._focusRuleIndex -= 1;
+    }
+    this.updateConfig({ auto_zoom: rules }, true);
+  }
+
+  startFocusAreaSelection(index) {
+    if (!this._config?.auto_zoom?.[index]) return;
+    this._focusRuleIndex = index;
+    this._mode = "focus-area";
+    this._selectedZoneId = null;
+    this._selectedVertexIndex = null;
+    this._draftPoints = [];
+    this.render();
+  }
+
+  cancelFocusAreaSelection() {
+    this._focusRuleIndex = null;
+    this._mode = "select";
+    this.render();
+  }
+
+  commitFocusArea(area) {
+    if (this._focusRuleIndex === null || !focusAreaValid(area)) return;
+    const index = this._focusRuleIndex;
+    this._focusRuleIndex = null;
+    this._mode = "select";
+    this.updateAutoZoomRule(index, (current) => ({
+      ...current,
+      target: "area",
+      area: normalizeFocusArea(area),
+    }), true);
+  }
+
   selectZone(zoneId) {
     if (!this._config?.zones?.some((zone) => zone.id === zoneId)) return;
     this._selectedZoneId = zoneId;
     this._selectedVertexIndex = null;
+    this._focusRuleIndex = null;
     this._mode = "edit";
     this._draftPoints = [];
     this.render();
@@ -1317,6 +1662,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
 
   startDrawing() {
     this._mode = "draw";
+    this._focusRuleIndex = null;
     this._selectedZoneId = null;
     this._selectedVertexIndex = null;
     this._draftPoints = [];
@@ -1400,6 +1746,19 @@ class FloorplanZoneCardEditor extends HTMLElement {
     input.placeholder = placeholder ?? "";
     input.addEventListener("input", () => onInput(input.value));
     return input;
+  }
+
+  createSelect(value, options, onChange) {
+    const select = document.createElement("select");
+    for (const option of options) {
+      const element = document.createElement("option");
+      element.value = option.value;
+      element.textContent = option.label;
+      select.append(element);
+    }
+    select.value = value ?? "";
+    select.addEventListener("change", () => onChange(select.value));
+    return select;
   }
 
   createColorInput(value, onInput) {
@@ -1568,6 +1927,154 @@ class FloorplanZoneCardEditor extends HTMLElement {
     return section;
   }
 
+  createAutoZoomEditor() {
+    const section = document.createElement("div");
+    section.className = "auto-zoom-editor";
+
+    const titleRow = document.createElement("div");
+    titleRow.className = "section-title";
+    const title = document.createElement("strong");
+    title.textContent = "Auto zoom";
+    const add = this.createButton("Add rule", () => this.addAutoZoomRule(), { compact: true });
+    titleRow.append(title, add);
+    section.append(titleRow);
+
+    const description = document.createElement("p");
+    description.className = "hint";
+    description.textContent = "Focus the floorplan automatically when an entity reaches an exact raw state. If multiple rules match, the first rule in this list has priority.";
+    section.append(description);
+
+    const rules = this._config?.auto_zoom ?? [];
+    if (!rules.length) {
+      const empty = document.createElement("p");
+      empty.className = "hint empty-rules";
+      empty.textContent = "No auto-zoom rules configured.";
+      section.append(empty);
+      return section;
+    }
+
+    rules.forEach((rule, index) => {
+      const card = document.createElement("section");
+      card.className = "auto-zoom-card";
+      if (this._mode === "focus-area" && this._focusRuleIndex === index) {
+        card.classList.add("selected");
+      }
+
+      const header = document.createElement("div");
+      header.className = "section-title";
+      const name = document.createElement("strong");
+      name.textContent = `Rule ${index + 1}`;
+      const actions = document.createElement("div");
+      actions.className = "toolbar";
+      actions.append(
+        this.createButton("↑", () => this.moveAutoZoomRule(index, -1), { compact: true, kind: "secondary", disabled: index === 0 }),
+        this.createButton("↓", () => this.moveAutoZoomRule(index, 1), { compact: true, kind: "secondary", disabled: index === rules.length - 1 }),
+        this.createButton("Delete", () => this.deleteAutoZoomRule(index), { compact: true, kind: "danger" }),
+      );
+      header.append(name, actions);
+      card.append(header);
+
+      if (customElements.get("ha-form")) {
+        const form = document.createElement("ha-form");
+        form.className = "native-form auto-zoom-native-form";
+        form.hass = this._hass;
+        form.data = { entity: rule.entity || undefined, state: rule.state ?? "" };
+        form.schema = [
+          { name: "entity", selector: { entity: {} } },
+          { name: "state", selector: { text: {} } },
+        ];
+        form.computeLabel = (schema) => schema.name === "entity" ? "Entity" : "Trigger state";
+        form.addEventListener("value-changed", (event) => {
+          event.stopPropagation();
+          const value = event.detail?.value ?? {};
+          this.updateAutoZoomRule(index, (current) => ({
+            ...current,
+            entity: value.entity ?? "",
+            state: value.state ?? "",
+          }));
+        });
+        card.append(form);
+      } else {
+        const grid = document.createElement("div");
+        grid.className = "grid";
+        grid.append(
+          this.createField("Entity", this.createTextInput(rule.entity, "binary_sensor.example", (value) => {
+            this.updateAutoZoomRule(index, (current) => ({ ...current, entity: value }));
+          })),
+          this.createField("Trigger state", this.createTextInput(rule.state, "on", (value) => {
+            this.updateAutoZoomRule(index, (current) => ({ ...current, state: value }));
+          })),
+        );
+        card.append(grid);
+      }
+
+      const settings = document.createElement("div");
+      settings.className = "grid";
+      settings.append(
+        this.createField("Focus target", this.createSelect(rule.target, [
+          { value: "zone", label: "Existing zone" },
+          { value: "area", label: "Custom area" },
+        ], (value) => {
+          this.updateAutoZoomRule(index, (current) => ({ ...current, target: value }), true);
+        })),
+        this.createField("When state no longer matches", this.createSelect(rule.exit_behavior, [
+          { value: "previous", label: "Return to previous view" },
+          { value: "reset", label: "Reset to 100%" },
+          { value: "keep", label: "Keep current view" },
+        ], (value) => {
+          this.updateAutoZoomRule(index, (current) => ({ ...current, exit_behavior: value }));
+        })),
+      );
+      card.append(settings);
+
+      if (rule.target === "zone") {
+        if ((this._config.zones?.length ?? 0) > 0) {
+          const options = [
+            { value: "", label: "Select a zone" },
+            ...this._config.zones.map((zone, zoneIndex) => ({
+              value: zone.id,
+              label: zone.name || `Zone ${zoneIndex + 1}`,
+            })),
+          ];
+          card.append(this.createField("Zone", this.createSelect(rule.zone_id, options, (value) => {
+            this.updateAutoZoomRule(index, (current) => ({ ...current, zone_id: value }));
+          })));
+        } else {
+          const warning = document.createElement("p");
+          warning.className = "hint";
+          warning.textContent = "Create a floorplan zone first, or switch this rule to Custom area.";
+          card.append(warning);
+        }
+      } else {
+        const areaRow = document.createElement("div");
+        areaRow.className = "focus-area-row";
+        const areaText = document.createElement("span");
+        areaText.className = "hint";
+        areaText.textContent = focusAreaValid(rule.area)
+          ? `Area: ${Math.round(rule.area.x * 100)}%, ${Math.round(rule.area.y * 100)}% · ${Math.round(rule.area.width * 100)}% × ${Math.round(rule.area.height * 100)}%`
+          : "No custom area selected yet.";
+        const selectArea = this.createButton(
+          focusAreaValid(rule.area) ? "Redraw area" : "Select area",
+          () => this.startFocusAreaSelection(index),
+          { kind: "secondary", compact: true },
+        );
+        areaRow.append(areaText, selectArea);
+        card.append(areaRow);
+      }
+
+      const current = entityRawState(this._hass, rule.entity);
+      const status = document.createElement("p");
+      status.className = "hint";
+      status.textContent = rule.entity
+        ? `Current raw state: ${current ?? "not available"}${current === rule.state ? " · condition matches" : ""}.`
+        : "Choose an entity and enter the exact raw state that should trigger this focus rule.";
+      card.append(status);
+      section.append(card);
+    });
+
+    return section;
+  }
+
   createStateRulesEditor(zone, zoneIndex) {
     const section = document.createElement("div");
     section.className = "state-rules";
@@ -1664,10 +2171,10 @@ class FloorplanZoneCardEditor extends HTMLElement {
     const style = document.createElement("style");
     style.textContent = `
       :host { display:block; }
-      .editor,.zones,.zone-card,.field,.preview,.fallback-form,.native-form-wrapper,.state-rules,.style-box,.actions-editor { display:grid; gap:10px; }
+      .editor,.zones,.zone-card,.field,.preview,.fallback-form,.native-form-wrapper,.state-rules,.style-box,.actions-editor,.auto-zoom-editor,.auto-zoom-card { display:grid; gap:10px; }
       .editor { gap:18px; }
       .field > span,.style-box-title { color:var(--primary-text-color); font-size:14px; font-weight:500; }
-      input { box-sizing:border-box; width:100%; min-height:42px; padding:8px 12px; border:1px solid var(--divider-color,#c7c7c7); border-radius:8px; background:var(--card-background-color,#fff); color:var(--primary-text-color,#212121); font:inherit; }
+      input,select { box-sizing:border-box; width:100%; min-height:42px; padding:8px 12px; border:1px solid var(--divider-color,#c7c7c7); border-radius:8px; background:var(--card-background-color,#fff); color:var(--primary-text-color,#212121); font:inherit; }
       input[type="color"] { width:54px; min-width:54px; padding:4px; }
       input[type="range"] { min-height:auto; padding:0; border:0; }
       button { min-height:40px; padding:8px 14px; border:0; border-radius:8px; background:var(--primary-color,#03a9f4); color:var(--text-primary-color,#fff); cursor:pointer; font:inherit; font-weight:500; }
@@ -1684,6 +2191,10 @@ class FloorplanZoneCardEditor extends HTMLElement {
       .zone-native-form { margin-top:4px; }
       .grid,.style-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
       .state-rules,.actions-editor { padding-top:4px; border-top:1px solid var(--divider-color,#ddd); }
+      .auto-zoom-editor { padding:14px; border:1px solid var(--divider-color,#d0d0d0); border-radius:10px; }
+      .auto-zoom-card { padding:12px; border:1px solid var(--divider-color,#ddd); border-radius:9px; }
+      .auto-zoom-card.selected { border-color:var(--primary-color,#03a9f4); box-shadow:inset 0 0 0 1px var(--primary-color,#03a9f4); }
+      .focus-area-row { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
       .state-rule-row { display:grid; grid-template-columns:minmax(110px,1fr) 54px minmax(140px,1fr) auto; gap:10px; align-items:center; }
       .opacity-control { display:grid; grid-template-columns:minmax(90px,1fr) 42px; gap:8px; align-items:center; }
       .opacity-control > span { color:var(--secondary-text-color,#727272); font-size:12px; text-align:right; }
@@ -1712,6 +2223,8 @@ class FloorplanZoneCardEditor extends HTMLElement {
     status.className = "mode-status";
     if (this._mode === "draw") {
       status.textContent = `Drawing · ${this._draftPoints.length} point${this._draftPoints.length === 1 ? "" : "s"}`;
+    } else if (this._mode === "focus-area") {
+      status.textContent = `Selecting auto-zoom area · Rule ${(this._focusRuleIndex ?? 0) + 1}`;
     } else if (this._mode === "edit") {
       status.textContent = this._selectedVertexIndex === null
         ? "Editing shape"
@@ -1736,6 +2249,9 @@ class FloorplanZoneCardEditor extends HTMLElement {
     canvas.addEventListener("floorplan-vertex-insert", (event) => {
       this.insertVertex(event.detail.zoneId, event.detail.afterIndex, event.detail.point);
     });
+    canvas.addEventListener("floorplan-focus-area-commit", (event) => {
+      this.commitFocusArea(event.detail.area);
+    });
     preview.append(previewTitle, canvas);
 
     const toolbar = document.createElement("div");
@@ -1748,6 +2264,10 @@ class FloorplanZoneCardEditor extends HTMLElement {
         }, { kind: "secondary", disabled: this._draftPoints.length === 0 }),
         this.createButton("Close polygon", () => this.closeDrawing(), { disabled: this._draftPoints.length < 3 }),
         this.createButton("Cancel", () => this.cancelDrawing(), { kind: "danger" }),
+      );
+    } else if (this._mode === "focus-area") {
+      toolbar.append(
+        this.createButton("Cancel area selection", () => this.cancelFocusAreaSelection(), { kind: "danger" }),
       );
     } else if (this._mode === "edit") {
       const zone = this._config.zones.find((item) => item.id === this._selectedZoneId);
@@ -1770,13 +2290,15 @@ class FloorplanZoneCardEditor extends HTMLElement {
     interactionHint.className = "hint";
     if (this._mode === "edit") {
       interactionHint.textContent = "Drag a blue vertex to move it. Click a white midpoint to insert a vertex. Use the zoom controls or mouse wheel/pinch, and drag empty space to pan. Zone actions stay disabled while editing.";
+    } else if (this._mode === "focus-area") {
+      interactionHint.textContent = "Drag a rectangle around the area that should fill the view when this rule matches. You can still use wheel or pinch to zoom before drawing it.";
     } else if (this._mode === "draw") {
       interactionHint.textContent = "Zoom with +/−, mouse wheel, or pinch. When zoomed, drag empty space to pan; a click still adds a polygon point.";
     } else {
       interactionHint.textContent = "Zoom with +/−, mouse wheel, or pinch. When zoomed, drag empty space to pan without changing zone coordinates.";
     }
     preview.append(interactionHint);
-    editor.append(preview);
+    editor.append(preview, this.createAutoZoomEditor());
 
     const zones = document.createElement("div");
     zones.className = "zones";
@@ -1784,7 +2306,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
     zoneTitle.className = "section-title";
     const heading = document.createElement("strong");
     heading.textContent = "Zones";
-    const add = this.createButton("Add zone", () => this.startDrawing(), { disabled: this._mode === "draw" });
+    const add = this.createButton("Add zone", () => this.startDrawing(), { disabled: this._mode === "draw" || this._mode === "focus-area" });
     zoneTitle.append(heading, add);
     zones.append(zoneTitle);
 
@@ -1813,7 +2335,13 @@ class FloorplanZoneCardEditor extends HTMLElement {
             this._selectedVertexIndex = null;
             this._mode = "select";
           }
-          this.updateConfig({ zones: this._config.zones.filter((_, i) => i !== index) }, true);
+          const zones = this._config.zones.filter((_, i) => i !== index);
+          const autoZoom = (this._config.auto_zoom ?? []).map((rule) =>
+            rule.target === "zone" && rule.zone_id === zone.id
+              ? normalizeAutoZoomRule({ ...rule, zone_id: "" })
+              : rule
+          );
+          this.updateConfig({ zones, auto_zoom: autoZoom }, true);
         }, { kind: "danger" }),
       );
       header.append(name, actions);

@@ -13,7 +13,8 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 5. add as many exact state → color/opacity rules as needed;
 6. optionally configure Home Assistant actions for the zone;
 7. zoom and pan the floorplan while keeping every zone aligned;
-8. save the card in the normal Home Assistant dashboard editor.
+8. optionally add state-triggered auto-zoom rules that focus a zone or a custom area;
+9. save the card in the normal Home Assistant dashboard editor.
 
 > [!IMPORTANT]
 > This repository is in active early development. The editor supports Home Assistant-native image/media, entity and action selectors, graphical polygon editing, unlimited exact-state styling rules, per-zone interactions, and synchronized floorplan zoom/pan.
@@ -33,6 +34,9 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Synchronized image + SVG zoom from `1x` to `5x`, with controls, mouse wheel and pinch gestures.
 - Pan while zoomed by dragging empty floorplan space; dragging an actionable zone cancels its action and pans instead.
 - Zoom state is UI-only and never changes the normalized polygon coordinates stored in the card configuration.
+- State-triggered auto-zoom rules with exact raw-state matching.
+- Auto-focus target can be an existing polygon zone or a custom rectangle drawn directly in the graphical editor.
+- Ordered auto-zoom priority and configurable exit behavior: previous view, reset to 100%, or keep current view.
 - Responsive image + SVG overlay renderer.
 - Resolution of `media-source://` images through Home Assistant before rendering.
 - Normalized polygon coordinates (`0..1`) so zones remain aligned while resizing.
@@ -118,6 +122,57 @@ The zoom range is currently fixed at `1x` to `5x` with `0.25x` button/wheel step
 
 The editor uses the same zoom model, making it possible to zoom into a small area before moving or inserting polygon vertices.
 
+## Auto zoom / focus rules
+
+Auto-zoom rules can move the user's attention to a specific part of the floorplan when an entity reaches an exact raw Home Assistant state. Rules are configured entirely in the graphical editor.
+
+Each rule contains:
+
+- a Home Assistant entity;
+- the exact raw state that activates the rule;
+- a focus target: **Existing zone** or **Custom area**;
+- an exit behavior for when the state no longer matches.
+
+Example using an existing zone:
+
+```yaml
+auto_zoom:
+  - entity: binary_sensor.machine_3_alarm
+    state: "on"
+    target: zone
+    zone_id: zone_3
+    exit_behavior: previous
+```
+
+The card calculates the polygon bounding box automatically and chooses the zoom needed to fit it, including a small margin. The configured zone points are never modified.
+
+A custom area can instead be drawn directly on the floorplan from **Select area** / **Redraw area**:
+
+```yaml
+auto_zoom:
+  - entity: sensor.machine_state
+    state: "fault"
+    target: area
+    area:
+      x: 0.42
+      y: 0.18
+      width: 0.24
+      height: 0.31
+    exit_behavior: reset
+```
+
+Custom focus rectangles use normalized `0..1` coordinates, just like polygon zones, so they remain correct at any dashboard size.
+
+Exit behaviors are:
+
+- `previous`: return to the view that was active before auto focus;
+- `reset`: return to `100%`;
+- `keep`: leave the floorplan at its current view.
+
+Rules are evaluated from top to bottom. If multiple conditions match, the first valid rule has priority. The editor provides **↑ / ↓** controls to reorder them.
+
+A matching rule is applied when it becomes the active rule (and also on initial card load when the state is already active). It is **not** continuously reapplied on every Home Assistant update, so the user may manually zoom or pan after the automatic focus without fighting the card.
+
 ## Backward compatibility
 
 Legacy binary configurations remain supported. Existing zones like:
@@ -142,6 +197,12 @@ type: custom:floorplan-zone-card
 image:
   media_content_id: media-source://image_upload/xxxxxxxx
   media_content_type: image/png
+auto_zoom:
+  - entity: binary_sensor.machine_room_alarm
+    state: "on"
+    target: zone
+    zone_id: zone_1
+    exit_behavior: previous
 zones:
   - id: zone_1
     name: Machine room
@@ -243,6 +304,9 @@ dist/ha-floorplan-zone-card.js
 - [x] Synchronized image + zone zoom controls
 - [x] Mouse-wheel and pinch zoom
 - [x] Pan while zoomed without rewriting polygon coordinates
+- [x] State-triggered auto zoom to existing zones
+- [x] Graphical custom auto-focus area selection
+- [x] Auto-zoom priority and exit behavior
 - [ ] Undo/redo for saved shape edits
 - [ ] Mobile editor polish
 - [ ] Runtime UX testing on a real Home Assistant dashboard
