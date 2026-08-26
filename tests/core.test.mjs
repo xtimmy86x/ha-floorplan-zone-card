@@ -1,0 +1,163 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { test } from "node:test";
+import vm from "node:vm";
+
+async function loadCore() {
+  const source = await readFile(new URL("../src/ha-floorplan-zone-card.js", import.meta.url), "utf8");
+  const registry = new Map();
+  const context = vm.createContext({
+    console: { ...console, info() {} },
+    setTimeout,
+    clearTimeout,
+    HTMLElement: class HTMLElement {},
+    Event: class Event {
+      constructor(type, options = {}) {
+        this.type = type;
+        this.bubbles = Boolean(options.bubbles);
+        this.composed = Boolean(options.composed);
+      }
+    },
+    CustomEvent: class CustomEvent {
+      constructor(type, options = {}) {
+        this.type = type;
+        this.detail = options.detail;
+        this.bubbles = Boolean(options.bubbles);
+        this.composed = Boolean(options.composed);
+      }
+    },
+    customElements: {
+      get(name) { return registry.get(name); },
+      define(name, value) { registry.set(name, value); },
+      whenDefined() { return Promise.resolve(); },
+    },
+    window: {},
+  });
+
+  const expose = `\n;globalThis.__core = {
+    normalizeStateRule,
+    stateRuleValidation,
+    normalizedConfig,
+    stateStyle,
+    autoZoomRuleValidation,
+    viewForFocusArea,
+    matchingAutoZoomRule,
+    zoneFocusArea,
+    effectiveAction,
+  };`;
+  vm.runInContext(source + expose, context, { filename: "ha-floorplan-zone-card.js" });
+  return context.__core;
+}
+
+const core = await loadCore();
+
+test("normalizes state effects and border flags safely", () => {
+  assert.deepEqual(
+    structuredClone(core.normalizeStateRule({ value: 3, color: "#123456", opacity: 0.6, effect: "blink", highlight_border: true })),
+    { value: "3", color: "#123456", opacity: 0.6, effect: "blink", highlight_border: true },
+  );
+  assert.equal(core.normalizeStateRule({ effect: "invalid" }).effect, "none");
+  assert.equal(core.normalizeStateRule({ highlight_border: "yes" }).highlight_border, false);
+});
+
+test("detects duplicate, empty and reserved state rules", () => {
+  const result = structuredClone(core.stateRuleValidation([
+    { value: "alarm" },
+    { value: "" },
+    { value: "alarm" },
+    { value: "unavailable" },
+    { value: "unknown" },
+  ]));
+  assert.deepEqual(result.emptyIndexes, [1]);
+  assert.deepEqual(result.duplicateIndexes, [0, 2]);
+  assert.deepEqual(result.duplicateValues, ["alarm"]);
+  assert.deepEqual(result.reservedIndexes, [3, 4]);
+});
+
+test("legacy on/off configuration is normalized with static effects", () => {
+  const config = structuredClone(core.normalizedConfig({
+    zones: [{
+      id: "zone_1",
+      entity: "binary_sensor.test",
+      on: { color: "#ff0000", opacity: 0.7 },
+      off: { color: "#000000", opacity: 0.1 },
+      points: [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 0, y: 1 }],
+    }],
+  }));
+  assert.equal(config.zones[0].on, undefined);
+  assert.equal(config.zones[0].off, undefined);
+  assert.deepEqual(config.zones[0].states.map(({ value, effect, highlight_border }) => ({ value, effect, highlight_border })), [
+    { value: "off", effect: "none", highlight_border: false },
+    { value: "on", effect: "none", highlight_border: false },
+  ]);
+});
+
+test("state styling uses first exact match and reserves unavailable states", () => {
+  const zone = core.normalizedConfig({
+    zones: [{
+      id: "zone_1",
+      entity: "sensor.mode",
+      states: [
+        { value: "alarm", color: "#111111", opacity: 0.2 },
+        { value: "alarm", color: "#222222", opacity: 0.8 },
+        { value: "unavailable", color: "#ff0000", opacity: 1 },
+      ],
+      unavailable: { color: "#999999", opacity: 0.3 },
+    }],
+  }).zones[0];
+
+  const alarm = core.stateStyle({ states: { "sensor.mode": { state: "alarm" } } }, zone);
+  assert.equal(alarm.color, "#111111");
+
+  const unavailable = core.stateStyle({ states: { "sensor.mode": { state: "unavailable" } } }, zone);
+  assert.equal(unavailable.color, "#999999");
+});
+
+test("auto zoom validation catches incomplete and stale rules", () => {
+  const config = { zones: [{ id: "zone_1" }] };
+  assert.deepEqual(structuredClone(core.autoZoomRuleValidation(config, { target: "zone", entity: "", state: "", zone_id: "" })), [
+    "Choose an entity.",
+    "Enter the exact trigger state.",
+    "Select a zone to focus.",
+  ]);
+  assert.deepEqual(structuredClone(core.autoZoomRuleValidation(config, { target: "zone", entity: "sensor.a", state: "on", zone_id: "missing" })), [
+    "The selected focus zone no longer exists.",
+  ]);
+  assert.deepEqual(structuredClone(core.autoZoomRuleValidation(config, { target: "area", entity: "sensor.a", state: "on" })), [
+    "Draw a valid custom focus area.",
+  ]);
+});
+
+test("auto zoom keeps rule order as priority", () => {
+  const config = core.normalizedConfig({
+    zones: [
+      { id: "zone_1", points: [{ x: 0.1, y: 0.1 }, { x: 0.3, y: 0.1 }, { x: 0.1, y: 0.3 }] },
+      { id: "zone_2", points: [{ x: 0.6, y: 0.6 }, { x: 0.9, y: 0.6 }, { x: 0.6, y: 0.9 }] },
+    ],
+    auto_zoom: [
+      { entity: "binary_sensor.a", state: "on", target: "zone", zone_id: "zone_1" },
+      { entity: "binary_sensor.b", state: "on", target: "zone", zone_id: "zone_2" },
+    ],
+  });
+  const hass = { states: {
+    "binary_sensor.a": { state: "on" },
+    "binary_sensor.b": { state: "on" },
+  } };
+  const match = core.matchingAutoZoomRule(config, hass);
+  assert.equal(match.index, 0);
+  assert.equal(match.rule.zone_id, "zone_1");
+});
+
+test("focus view stays bounded and respects zoom limits", () => {
+  const view = structuredClone(core.viewForFocusArea({ x: 0.9, y: 0.9, width: 0.05, height: 0.05 }));
+  assert.equal(view.scale, 5);
+  assert.ok(view.centerX <= 0.9);
+  assert.ok(view.centerY <= 0.9);
+  assert.ok(view.centerX >= 0.1);
+  assert.ok(view.centerY >= 0.1);
+});
+
+test("legacy zones keep implicit more-info tap action", () => {
+  const action = structuredClone(core.effectiveAction({ entity: "sensor.example" }, "tap_action"));
+  assert.deepEqual(action, { action: "more-info" });
+});

@@ -2,7 +2,7 @@ const CARD_TYPE = "floorplan-zone-card";
 const CARD_TAG = "floorplan-zone-card";
 const EDITOR_TAG = "floorplan-zone-card-editor";
 const CANVAS_TAG = "floorplan-zone-canvas";
-const VERSION = "0.1.0-dev.7";
+const VERSION = "0.1.0-dev.8";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const SVG_SIZE = 1000;
 
@@ -25,6 +25,7 @@ const AUTO_ZOOM_TRANSITION_MS = 360;
 const MIN_FOCUS_AREA_SIZE = 0.01;
 const AUTO_ZOOM_EXIT_BEHAVIORS = new Set(["previous", "reset", "keep"]);
 const STATE_EFFECTS = new Set(["none", "pulse", "blink"]);
+const UNAVAILABLE_ENTITY_STATES = new Set(["unknown", "unavailable"]);
 const HIGHLIGHT_BORDER_WIDTH = 4;
 
 function deepClone(value) {
@@ -56,6 +57,38 @@ function normalizeStateRule(rule) {
     ...normalizeStyle(rule, DEFAULT_FALLBACK_STYLE),
     effect: STATE_EFFECTS.has(rule?.effect) ? rule.effect : "none",
     highlight_border: rule?.highlight_border === true,
+  };
+}
+
+function stateRuleValidation(states) {
+  const indexesByValue = new Map();
+  const emptyIndexes = [];
+  const reservedIndexes = [];
+  const duplicateIndexes = new Set();
+
+  (states ?? []).forEach((rule, index) => {
+    const value = rule?.value === undefined || rule?.value === null
+      ? ""
+      : String(rule.value);
+    if (value === "") emptyIndexes.push(index);
+    if (UNAVAILABLE_ENTITY_STATES.has(value)) reservedIndexes.push(index);
+    const indexes = indexesByValue.get(value) ?? [];
+    indexes.push(index);
+    indexesByValue.set(value, indexes);
+  });
+
+  const duplicateValues = [];
+  indexesByValue.forEach((indexes, value) => {
+    if (indexes.length < 2) return;
+    duplicateValues.push(value);
+    indexes.forEach((index) => duplicateIndexes.add(index));
+  });
+
+  return {
+    emptyIndexes,
+    reservedIndexes,
+    duplicateIndexes: [...duplicateIndexes].sort((a, b) => a - b),
+    duplicateValues,
   };
 }
 
@@ -150,6 +183,24 @@ function matchingAutoZoomRule(config, hass) {
   return null;
 }
 
+function autoZoomRuleValidation(config, rule) {
+  const issues = [];
+  if (!rule?.entity) issues.push("Choose an entity.");
+  if (rule?.state === undefined || rule?.state === null || String(rule.state) === "") {
+    issues.push("Enter the exact trigger state.");
+  }
+
+  if (rule?.target === "area") {
+    if (!focusAreaValid(rule?.area)) issues.push("Draw a valid custom focus area.");
+  } else if (!rule?.zone_id) {
+    issues.push("Select a zone to focus.");
+  } else if (!(config?.zones ?? []).some((zone) => zone.id === rule.zone_id)) {
+    issues.push("The selected focus zone no longer exists.");
+  }
+
+  return issues;
+}
+
 function legacyStateRules(zone) {
   const rules = [];
   if (zone?.off) {
@@ -231,7 +282,7 @@ function entityRawState(hass, entityId) {
 
 function stateStyle(hass, zone) {
   const state = entityRawState(hass, zone.entity);
-  if (state === undefined || state === "unknown" || state === "unavailable") {
+  if (state === undefined || UNAVAILABLE_ENTITY_STATES.has(state)) {
     return zone.unavailable ?? DEFAULT_UNAVAILABLE_STYLE;
   }
   const rule = (zone.states ?? []).find((item) => String(item.value) === state);
@@ -2149,6 +2200,14 @@ class FloorplanZoneCardEditor extends HTMLElement {
         card.append(areaRow);
       }
 
+      const validationIssues = autoZoomRuleValidation(this._config, rule);
+      if (validationIssues.length) {
+        const warning = document.createElement("p");
+        warning.className = "validation-warning";
+        warning.textContent = validationIssues.join(" ");
+        card.append(warning);
+      }
+
       const current = entityRawState(this._hass, rule.entity);
       const status = document.createElement("p");
       status.className = "hint";
@@ -2179,8 +2238,15 @@ class FloorplanZoneCardEditor extends HTMLElement {
     section.append(headingRow);
     const description = document.createElement("p");
     description.className = "hint";
-    description.textContent = "Match the entity raw state exactly, then choose its color, opacity, visual effect and optional active border.";
+    description.textContent = "Match the entity raw state exactly, then choose its color, opacity, visual effect and optional active border. The live preview uses the entity's current raw state.";
     section.append(description);
+    const validation = stateRuleValidation(zone.states ?? []);
+    if (validation.duplicateValues.length) {
+      const warning = document.createElement("p");
+      warning.className = "validation-warning";
+      warning.textContent = `Duplicate state values detected (${validation.duplicateValues.map((value) => value || "empty").join(", ")}). The first matching rule wins.`;
+      section.append(warning);
+    }
     if (!(zone.states?.length ?? 0)) {
       const empty = document.createElement("p");
       empty.className = "hint empty-rules";
@@ -2188,8 +2254,22 @@ class FloorplanZoneCardEditor extends HTMLElement {
       section.append(empty);
     }
     (zone.states ?? []).forEach((rule, ruleIndex) => {
+      const item = document.createElement("div");
+      item.className = "state-rule-item";
       const row = document.createElement("div");
       row.className = "state-rule-row";
+      const ruleWarnings = [];
+      if (validation.emptyIndexes.includes(ruleIndex)) {
+        ruleWarnings.push("State value is empty and is unlikely to match a Home Assistant entity state.");
+      }
+      if (validation.duplicateIndexes.includes(ruleIndex)) {
+        ruleWarnings.push("This state value is duplicated; only the first matching rule is used.");
+      }
+      if (validation.reservedIndexes.includes(ruleIndex)) {
+        ruleWarnings.push(`"${rule.value}" always uses the dedicated Unavailable / unknown style, so this rule cannot be reached.`);
+      }
+      if (ruleWarnings.length) row.classList.add("has-warning");
+
       const valueInput = this.createTextInput(rule.value, "State value", (value) => {
         this.updateZone(zoneIndex, (current) => {
           const states = deepClone(current.states ?? []);
@@ -2198,6 +2278,12 @@ class FloorplanZoneCardEditor extends HTMLElement {
         });
       });
       valueInput.setAttribute("aria-label", "State value");
+      valueInput.classList.add("state-value-input");
+      if (ruleWarnings.length) {
+        valueInput.setAttribute("aria-invalid", "true");
+        valueInput.title = ruleWarnings.join(" ");
+      }
+      valueInput.addEventListener("change", () => this.render());
       const colorInput = this.createColorInput(rule.color, (value) => {
         this.updateZone(zoneIndex, (current) => {
           const states = deepClone(current.states ?? []);
@@ -2242,8 +2328,16 @@ class FloorplanZoneCardEditor extends HTMLElement {
           states: (current.states ?? []).filter((_, index) => index !== ruleIndex),
         }), true);
       }, { kind: "danger", compact: true });
+      remove.classList.add("state-rule-delete");
       row.append(valueInput, colorInput, opacity, effect, highlightBorder, remove);
-      section.append(row);
+      item.append(row);
+      if (ruleWarnings.length) {
+        const warning = document.createElement("p");
+        warning.className = "validation-warning rule-warning";
+        warning.textContent = ruleWarnings.join(" ");
+        item.append(warning);
+      }
+      section.append(item);
     });
     const styleGrid = document.createElement("div");
     styleGrid.className = "style-grid";
@@ -2306,18 +2400,28 @@ class FloorplanZoneCardEditor extends HTMLElement {
       .auto-zoom-card { padding:12px; border:1px solid var(--divider-color,#ddd); border-radius:9px; }
       .auto-zoom-card.selected { border-color:var(--primary-color,#03a9f4); box-shadow:inset 0 0 0 1px var(--primary-color,#03a9f4); }
       .focus-area-row { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-      .state-rule-row { display:grid; grid-template-columns:minmax(110px,1fr) 54px minmax(140px,1fr) minmax(110px,.7fr) auto auto; gap:10px; align-items:center; }
+      .state-rule-item { display:grid; gap:6px; }
+      .state-rule-row { display:grid; grid-template-columns:minmax(110px,1fr) 54px minmax(140px,1fr) minmax(110px,.7fr) auto auto; gap:10px; align-items:center; padding:6px; border:1px solid transparent; border-radius:8px; }
+      .state-rule-row.has-warning { border-color:var(--warning-color,#f57c00); background:color-mix(in srgb,var(--warning-color,#f57c00) 7%,transparent); }
       .checkbox-control { display:flex; align-items:center; gap:7px; min-height:42px; color:var(--primary-text-color,#212121); font-size:13px; white-space:nowrap; cursor:pointer; }
       .opacity-control { display:grid; grid-template-columns:minmax(90px,1fr) 42px; gap:8px; align-items:center; }
       .opacity-control > span { color:var(--secondary-text-color,#727272); font-size:12px; text-align:right; }
       .style-box { padding:10px; border:1px solid var(--divider-color,#ddd); border-radius:8px; }
       .style-controls { display:grid; grid-template-columns:54px minmax(140px,1fr); gap:10px; align-items:center; }
       .hint { margin:0; color:var(--secondary-text-color,#727272); font-size:13px; line-height:1.45; }
+      .validation-warning { margin:0; color:var(--warning-color,#f57c00); font-size:12px; line-height:1.45; font-weight:500; }
+      .rule-warning { padding:0 6px; }
       .empty-rules { font-style:italic; }
       @media (max-width:700px) {
         .grid,.style-grid { grid-template-columns:1fr; }
         .state-rule-row { grid-template-columns:minmax(0,1fr) 54px; }
         .state-rule-row .opacity-control,.state-rule-row select,.state-rule-row .checkbox-control { grid-column:1/-1; }
+        .state-rule-delete { grid-column:1/-1; justify-self:end; }
+      }
+      @media (max-width:520px) {
+        .zone-card > .section-title,.auto-zoom-card > .section-title { align-items:flex-start; flex-direction:column; }
+        .zone-card > .section-title .toolbar,.auto-zoom-card > .section-title .toolbar { width:100%; }
+        .focus-area-row { align-items:flex-start; }
       }
     `;
 

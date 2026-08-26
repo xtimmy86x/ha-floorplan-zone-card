@@ -45,6 +45,9 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Midpoint handles for inserting new vertices.
 - Selected-vertex deletion while preserving the minimum three-point polygon.
 - Vertex updates committed only on pointer release.
+- Editor validation warnings for empty, duplicate and reserved state rules, plus incomplete auto-zoom rules.
+- Automated Node.js core tests covering normalization, legacy compatibility, state precedence and auto-zoom behavior.
+- Responsive editor polish for state-rule controls and compact mobile rule headers.
 - HACS-compatible `dist/ha-floorplan-zone-card.js` output.
 
 ## State styles and visual effects
@@ -99,6 +102,12 @@ Rules are evaluated in this order:
 3. no matching rule → `default` fallback style.
 
 The visual editor provides **Add state** and **Delete** controls and does not impose a limit on the number of state rules. Each row also includes an **Effect** selector and a **Highlight border** flag.
+
+The editor warns without blocking saves when:
+
+- a state value is empty;
+- the same exact state value appears more than once (runtime precedence remains **first match wins**);
+- a rule uses `unknown` or `unavailable`, which are handled by the dedicated **Unavailable / unknown** style and therefore cannot reach a normal state rule.
 
 Newly drawn zones start with `off` and `on` rules as a convenience for binary entities, but they can be edited, removed, or replaced with any values.
 
@@ -188,6 +197,8 @@ Exit behaviors are:
 - `keep`: leave the floorplan at its current view.
 
 Rules are evaluated from top to bottom. If multiple conditions match, the first valid rule has priority. The editor provides **↑ / ↓** controls to reorder them.
+
+Incomplete rules are highlighted in the editor, for example when the entity, trigger state, target zone, or custom focus area is missing. The warning is advisory and does not rewrite or delete the user's configuration.
 
 A matching rule is applied when it becomes the active rule (and also on initial card load when the state is already active). It is **not** continuously reapplied on every Home Assistant update, so the user may manually zoom or pan after the automatic focus without fighting the card.
 
@@ -285,9 +296,12 @@ When a zone is in **Edit shape** mode:
 Requires Node.js 22 or newer. There are no runtime or build dependencies in the current development version.
 
 ```bash
+npm test
 npm run check
 npm run build
 ```
+
+`npm run check` includes the automated test suite, so the existing CI check step also verifies core behavior before rebuilding `dist`.
 
 The production file is written to:
 
@@ -334,7 +348,9 @@ dist/ha-floorplan-zone-card.js
 - [x] Graphical custom auto-focus area selection
 - [x] Auto-zoom priority and exit behavior
 - [ ] Undo/redo for saved shape edits
-- [ ] Mobile editor polish
+- [x] State-rule and auto-zoom validation warnings
+- [x] Automated core regression tests
+- [x] Responsive mobile editor layout polish
 - [ ] Runtime UX testing on a real Home Assistant dashboard
 
 ### Later
