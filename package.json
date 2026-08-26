@@ -1,9 +1,9 @@
 {
   "name": "ha-floorplan-zone-card",
-  "version": "0.1.0-dev.6",
+  "version": "0.1.0-dev.7",
   "private": true,
   "type": "module",
-  "description": "A visual Home Assistant floorplan card with state-driven polygon zones, native actions, zoom/pan and state-triggered auto focus.",
+  "description": "A visual Home Assistant floorplan card with state-driven polygon zones, native actions, zoom/pan, auto focus and animated state effects.",
   "scripts": {
     "build": "node scripts/build.mjs",
     "check": "node --check src/ha-floorplan-zone-card.js && node --check scripts/build.mjs"

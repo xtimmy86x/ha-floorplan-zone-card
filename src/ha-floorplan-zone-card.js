@@ -2,7 +2,7 @@ const CARD_TYPE = "floorplan-zone-card";
 const CARD_TAG = "floorplan-zone-card";
 const EDITOR_TAG = "floorplan-zone-card-editor";
 const CANVAS_TAG = "floorplan-zone-canvas";
-const VERSION = "0.1.0-dev.6";
+const VERSION = "0.1.0-dev.7";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const SVG_SIZE = 1000;
 
@@ -24,6 +24,8 @@ const AUTO_ZOOM_PADDING = 0.12;
 const AUTO_ZOOM_TRANSITION_MS = 360;
 const MIN_FOCUS_AREA_SIZE = 0.01;
 const AUTO_ZOOM_EXIT_BEHAVIORS = new Set(["previous", "reset", "keep"]);
+const STATE_EFFECTS = new Set(["none", "pulse", "blink"]);
+const HIGHLIGHT_BORDER_WIDTH = 4;
 
 function deepClone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -52,6 +54,8 @@ function normalizeStateRule(rule) {
   return {
     value: rule?.value === undefined || rule?.value === null ? "" : String(rule.value),
     ...normalizeStyle(rule, DEFAULT_FALLBACK_STYLE),
+    effect: STATE_EFFECTS.has(rule?.effect) ? rule.effect : "none",
+    highlight_border: rule?.highlight_border === true,
   };
 }
 
@@ -148,8 +152,12 @@ function matchingAutoZoomRule(config, hass) {
 
 function legacyStateRules(zone) {
   const rules = [];
-  if (zone?.off) rules.push({ value: "off", ...normalizeStyle(zone.off, DEFAULT_OFF_STYLE) });
-  if (zone?.on) rules.push({ value: "on", ...normalizeStyle(zone.on, DEFAULT_ON_STYLE) });
+  if (zone?.off) {
+    rules.push(normalizeStateRule({ value: "off", ...normalizeStyle(zone.off, DEFAULT_OFF_STYLE) }));
+  }
+  if (zone?.on) {
+    rules.push(normalizeStateRule({ value: "on", ...normalizeStyle(zone.on, DEFAULT_ON_STYLE) }));
+  }
   return rules;
 }
 
@@ -204,8 +212,8 @@ function createZone(points, zones) {
     entity: "",
     points: points.map(normalizePoint),
     states: [
-      { value: "off", ...DEFAULT_OFF_STYLE },
-      { value: "on", ...DEFAULT_ON_STYLE },
+      { value: "off", ...DEFAULT_OFF_STYLE, effect: "none", highlight_border: false },
+      { value: "on", ...DEFAULT_ON_STYLE, effect: "none", highlight_border: false },
     ],
     default: { ...DEFAULT_FALLBACK_STYLE },
     unavailable: { ...DEFAULT_UNAVAILABLE_STYLE },
@@ -339,6 +347,11 @@ class FloorplanZoneCanvas extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    const key = imageContentId(this._config?.image);
+    if (key && key === this._imageKey && this._resolvedImage) {
+      this.updateZoneVisualStates();
+      return;
+    }
     this.refreshImage();
   }
 
@@ -999,6 +1012,59 @@ class FloorplanZoneCanvas extends HTMLElement {
     container.append(controls);
   }
 
+  applyZoneVisualState(polygon, zone) {
+    if (!polygon || !zone) return;
+    const zoneStyle = stateStyle(this._hass, zone);
+    const rawState = entityRawState(this._hass, zone.entity);
+    const accessibleName = zone.name || zone.entity || zone.id || "Zone";
+    const fillOpacity = zoneStyle.opacity ?? DEFAULT_FALLBACK_STYLE.opacity;
+    const effect = STATE_EFFECTS.has(zoneStyle.effect) ? zoneStyle.effect : "none";
+    const highlightBorder = zoneStyle.highlight_border === true;
+
+    polygon.classList.remove("effect-pulse", "effect-blink", "highlight-border");
+    polygon.setAttribute("fill", zoneStyle.color ?? DEFAULT_FALLBACK_STYLE.color);
+    polygon.setAttribute("fill-opacity", String(fillOpacity));
+    polygon.style.setProperty("--zone-fill-opacity", String(fillOpacity));
+    polygon.style.setProperty(
+      "--zone-effect-low-opacity",
+      String(Math.max(0.02, fillOpacity * 0.35)),
+    );
+    if (effect !== "none") polygon.classList.add(`effect-${effect}`);
+
+    if (highlightBorder) {
+      polygon.classList.add("highlight-border");
+      polygon.setAttribute("stroke", zoneStyle.color ?? DEFAULT_FALLBACK_STYLE.color);
+      polygon.setAttribute(
+        "stroke-width",
+        String(Math.max(Number(zone.stroke?.width) || 0, HIGHLIGHT_BORDER_WIDTH)),
+      );
+    } else {
+      polygon.setAttribute("stroke", zone.stroke?.color ?? "transparent");
+      polygon.setAttribute("stroke-width", String(zone.stroke?.width ?? 0));
+    }
+
+    let title = polygon.querySelector("title");
+    if (!title) {
+      title = document.createElementNS(SVG_NS, "title");
+      polygon.append(title);
+    }
+    title.textContent = `${accessibleName}${rawState !== undefined ? ` · ${rawState}` : ""}`;
+  }
+
+  updateZoneVisualStates() {
+    const polygons = this.shadowRoot?.querySelectorAll("polygon.zone[data-zone-id]");
+    if (!polygons?.length) return;
+    const configuredZones = this._config?.zones ?? [];
+    const zonesById = new Map(
+      configuredZones.filter((zone) => zone.id).map((zone) => [zone.id, zone]),
+    );
+    polygons.forEach((polygon, index) => {
+      const zoneId = polygon.dataset.zoneId ?? "";
+      const zone = (zoneId ? zonesById.get(zoneId) : undefined) ?? configuredZones[index];
+      if (zone) this.applyZoneVisualState(polygon, zone);
+    });
+  }
+
   render() {
     if (!this.shadowRoot) return;
     this._drag = null;
@@ -1025,7 +1091,22 @@ class FloorplanZoneCanvas extends HTMLElement {
       .transform-layer.empty { aspect-ratio:16/9; min-height:220px; }
       img { display:block; width:100%; height:auto; user-select:none; pointer-events:none; }
       svg { position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
-      polygon.zone { vector-effect:non-scaling-stroke; transition:fill 160ms ease,fill-opacity 160ms ease,stroke 120ms ease,filter 80ms ease; }
+      polygon.zone { vector-effect:non-scaling-stroke; transition:fill 160ms ease,fill-opacity 160ms ease,stroke 120ms ease,stroke-width 120ms ease,filter 80ms ease; }
+      polygon.zone.effect-pulse { animation:zone-pulse 1.4s ease-in-out infinite; }
+      polygon.zone.effect-blink { animation:zone-blink 1s steps(1,end) infinite; }
+      polygon.zone.highlight-border { stroke-linejoin:round; stroke-linecap:round; }
+      @keyframes zone-pulse {
+        0%,100% { fill-opacity:var(--zone-fill-opacity); }
+        50% { fill-opacity:var(--zone-effect-low-opacity); }
+      }
+      @keyframes zone-blink {
+        0%,49% { fill-opacity:var(--zone-fill-opacity); }
+        50%,99% { fill-opacity:.02; }
+        100% { fill-opacity:var(--zone-fill-opacity); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        polygon.zone.effect-pulse,polygon.zone.effect-blink { animation:none; }
+      }
       polygon.actionable { cursor:pointer; pointer-events:auto; }
       polygon.actionable.pressed { filter:brightness(.88); }
       polygon.actionable:focus-visible { outline:none; stroke:var(--primary-color,#03a9f4)!important; stroke-width:4!important; }
@@ -1090,16 +1171,11 @@ class FloorplanZoneCanvas extends HTMLElement {
     for (const zone of this._config?.zones ?? []) {
       if (!Array.isArray(zone.points) || zone.points.length < 3) continue;
       const polygon = document.createElementNS(SVG_NS, "polygon");
-      const zoneStyle = stateStyle(this._hass, zone);
-      const rawState = entityRawState(this._hass, zone.entity);
       const accessibleName = zone.name || zone.entity || zone.id || "Zone";
       polygon.classList.add("zone");
       polygon.dataset.zoneId = zone.id ?? "";
       polygon.setAttribute("points", pointList(zone.points));
-      polygon.setAttribute("fill", zoneStyle.color ?? DEFAULT_FALLBACK_STYLE.color);
-      polygon.setAttribute("fill-opacity", String(zoneStyle.opacity ?? DEFAULT_FALLBACK_STYLE.opacity));
-      polygon.setAttribute("stroke", zone.stroke?.color ?? "transparent");
-      polygon.setAttribute("stroke-width", String(zone.stroke?.width ?? 0));
+      this.applyZoneVisualState(polygon, zone);
 
       if (interactive && mode !== "draw" && mode !== "focus-area") {
         polygon.classList.add("selectable");
@@ -1133,9 +1209,6 @@ class FloorplanZoneCanvas extends HTMLElement {
         polygon.classList.add("selected");
       }
 
-      const title = document.createElementNS(SVG_NS, "title");
-      title.textContent = `${accessibleName}${rawState !== undefined ? ` · ${rawState}` : ""}`;
-      polygon.append(title);
       svg.append(polygon);
 
       if (interactive && zone.id === selectedZoneId && mode === "edit") {
@@ -1511,7 +1584,8 @@ class FloorplanZoneCardEditor extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    this.updatePreview();
+    const canvas = this.shadowRoot?.querySelector(CANVAS_TAG);
+    if (canvas) canvas.hass = hass;
     this.shadowRoot?.querySelectorAll("ha-form").forEach((form) => { form.hass = hass; });
   }
 
@@ -1759,6 +1833,19 @@ class FloorplanZoneCardEditor extends HTMLElement {
     select.value = value ?? "";
     select.addEventListener("change", () => onChange(select.value));
     return select;
+  }
+
+  createCheckbox(labelText, checked, onChange) {
+    const label = document.createElement("label");
+    label.className = "checkbox-control";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = Boolean(checked);
+    input.addEventListener("change", () => onChange(input.checked));
+    const text = document.createElement("span");
+    text.textContent = labelText;
+    label.append(input, text);
+    return label;
   }
 
   createColorInput(value, onInput) {
@@ -2081,18 +2168,18 @@ class FloorplanZoneCardEditor extends HTMLElement {
     const headingRow = document.createElement("div");
     headingRow.className = "section-title";
     const heading = document.createElement("strong");
-    heading.textContent = "State colors";
+    heading.textContent = "State styles";
     const add = this.createButton("Add state", () => {
       this.updateZone(zoneIndex, (current) => ({
         ...current,
-        states: [...(current.states ?? []), { value: "", ...DEFAULT_FALLBACK_STYLE }],
+        states: [...(current.states ?? []), { value: "", ...DEFAULT_FALLBACK_STYLE, effect: "none", highlight_border: false }],
       }), true);
     }, { compact: true });
     headingRow.append(heading, add);
     section.append(headingRow);
     const description = document.createElement("p");
     description.className = "hint";
-    description.textContent = "Match the entity raw state exactly. Add as many state/color rules as needed.";
+    description.textContent = "Match the entity raw state exactly, then choose its color, opacity, visual effect and optional active border.";
     section.append(description);
     if (!(zone.states?.length ?? 0)) {
       const empty = document.createElement("p");
@@ -2126,13 +2213,36 @@ class FloorplanZoneCardEditor extends HTMLElement {
           return { ...current, states };
         });
       });
+      const effect = this.createSelect(rule.effect ?? "none", [
+        { value: "none", label: "No effect" },
+        { value: "pulse", label: "Pulse" },
+        { value: "blink", label: "Blink" },
+      ], (value) => {
+        this.updateZone(zoneIndex, (current) => {
+          const states = deepClone(current.states ?? []);
+          states[ruleIndex] = { ...states[ruleIndex], effect: value };
+          return { ...current, states };
+        });
+      });
+      effect.setAttribute("aria-label", "State visual effect");
+      const highlightBorder = this.createCheckbox(
+        "Highlight border",
+        rule.highlight_border === true,
+        (value) => {
+          this.updateZone(zoneIndex, (current) => {
+            const states = deepClone(current.states ?? []);
+            states[ruleIndex] = { ...states[ruleIndex], highlight_border: value };
+            return { ...current, states };
+          });
+        },
+      );
       const remove = this.createButton("Delete", () => {
         this.updateZone(zoneIndex, (current) => ({
           ...current,
           states: (current.states ?? []).filter((_, index) => index !== ruleIndex),
         }), true);
       }, { kind: "danger", compact: true });
-      row.append(valueInput, colorInput, opacity, remove);
+      row.append(valueInput, colorInput, opacity, effect, highlightBorder, remove);
       section.append(row);
     });
     const styleGrid = document.createElement("div");
@@ -2177,6 +2287,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
       input,select { box-sizing:border-box; width:100%; min-height:42px; padding:8px 12px; border:1px solid var(--divider-color,#c7c7c7); border-radius:8px; background:var(--card-background-color,#fff); color:var(--primary-text-color,#212121); font:inherit; }
       input[type="color"] { width:54px; min-width:54px; padding:4px; }
       input[type="range"] { min-height:auto; padding:0; border:0; }
+      input[type="checkbox"] { width:18px; min-width:18px; min-height:18px; padding:0; margin:0; accent-color:var(--primary-color,#03a9f4); }
       button { min-height:40px; padding:8px 14px; border:0; border-radius:8px; background:var(--primary-color,#03a9f4); color:var(--text-primary-color,#fff); cursor:pointer; font:inherit; font-weight:500; }
       button.compact { min-height:34px; padding:6px 10px; font-size:13px; }
       button.secondary { background:transparent; color:var(--primary-color,#03a9f4); border:1px solid var(--primary-color,#03a9f4); }
@@ -2195,7 +2306,8 @@ class FloorplanZoneCardEditor extends HTMLElement {
       .auto-zoom-card { padding:12px; border:1px solid var(--divider-color,#ddd); border-radius:9px; }
       .auto-zoom-card.selected { border-color:var(--primary-color,#03a9f4); box-shadow:inset 0 0 0 1px var(--primary-color,#03a9f4); }
       .focus-area-row { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-      .state-rule-row { display:grid; grid-template-columns:minmax(110px,1fr) 54px minmax(140px,1fr) auto; gap:10px; align-items:center; }
+      .state-rule-row { display:grid; grid-template-columns:minmax(110px,1fr) 54px minmax(140px,1fr) minmax(110px,.7fr) auto auto; gap:10px; align-items:center; }
+      .checkbox-control { display:flex; align-items:center; gap:7px; min-height:42px; color:var(--primary-text-color,#212121); font-size:13px; white-space:nowrap; cursor:pointer; }
       .opacity-control { display:grid; grid-template-columns:minmax(90px,1fr) 42px; gap:8px; align-items:center; }
       .opacity-control > span { color:var(--secondary-text-color,#727272); font-size:12px; text-align:right; }
       .style-box { padding:10px; border:1px solid var(--divider-color,#ddd); border-radius:8px; }
@@ -2205,7 +2317,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
       @media (max-width:700px) {
         .grid,.style-grid { grid-template-columns:1fr; }
         .state-rule-row { grid-template-columns:minmax(0,1fr) 54px; }
-        .state-rule-row .opacity-control { grid-column:1/-1; }
+        .state-rule-row .opacity-control,.state-rule-row select,.state-rule-row .checkbox-control { grid-column:1/-1; }
       }
     `;
 

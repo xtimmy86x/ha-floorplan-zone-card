@@ -10,14 +10,14 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 2. add a zone;
 3. draw the zone directly on the floorplan;
 4. select any Home Assistant entity;
-5. add as many exact state → color/opacity rules as needed;
+5. add as many exact state → visual-style rules as needed, including color, opacity, pulse/blink effects and border highlighting;
 6. optionally configure Home Assistant actions for the zone;
 7. zoom and pan the floorplan while keeping every zone aligned;
 8. optionally add state-triggered auto-zoom rules that focus a zone or a custom area;
 9. save the card in the normal Home Assistant dashboard editor.
 
 > [!IMPORTANT]
-> This repository is in active early development. The editor supports Home Assistant-native image/media, entity and action selectors, graphical polygon editing, unlimited exact-state styling rules, per-zone interactions, and synchronized floorplan zoom/pan.
+> This repository is in active early development. The editor supports Home Assistant-native image/media, entity and action selectors, graphical polygon editing, unlimited exact-state styling rules with optional visual effects, per-zone interactions, and synchronized floorplan zoom/pan.
 
 ## Current development scope
 
@@ -26,7 +26,7 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Home Assistant image/media selector with image upload support.
 - Backward-compatible support for legacy image URL/path configurations.
 - Home Assistant entity selector with no domain restriction.
-- Unlimited exact raw-state color/opacity rules per zone.
+- Unlimited exact raw-state style rules per zone, including color, opacity, pulse/blink effects and active-border highlighting.
 - Separate fallback and unavailable/unknown styles.
 - Backward-compatible migration of legacy binary `on` / `off` zone styles.
 - Per-zone `tap_action`, `hold_action`, and `double_tap_action` using Home Assistant's standard action model.
@@ -47,25 +47,33 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Vertex updates committed only on pointer release.
 - HACS-compatible `dist/ha-floorplan-zone-card.js` output.
 
-## State color rules
+## State styles and visual effects
 
-Each zone can use any Home Assistant entity. Rules compare against the entity's **raw state** (`hass.states[entity_id].state`) using exact string matching.
+Each zone can use any Home Assistant entity. Rules compare against the entity's **raw state** (`hass.states[entity_id].state`) using exact string matching. Besides color and opacity, an exact state rule can enable a visual effect and highlight the polygon border while that state is active.
 
 ```yaml
 entity: sensor.machine_state
 states:
-  - value: "0"
+  - value: "idle"
     color: "#808080"
     opacity: 0.15
-  - value: "1"
+    effect: none
+    highlight_border: false
+  - value: "running"
     color: "#00c853"
     opacity: 0.45
-  - value: "2"
+    effect: none
+    highlight_border: false
+  - value: "warning"
     color: "#ffcc00"
     opacity: 0.55
-  - value: "3"
+    effect: pulse
+    highlight_border: true
+  - value: "alarm"
     color: "#ff0000"
     opacity: 0.65
+    effect: blink
+    highlight_border: true
 default:
   color: "#808080"
   opacity: 0.10
@@ -74,13 +82,23 @@ unavailable:
   opacity: 0.20
 ```
 
+Supported effects are:
+
+- `none` — static fill;
+- `pulse` — smoothly fades the active fill in and out;
+- `blink` — clearly alternates the active fill for alarm-style feedback.
+
+When `highlight_border: true`, the active state's color is also used for a thicker polygon border. The border remains visible while the fill pulses or blinks, so the affected area stays easy to locate. SVG `vector-effect: non-scaling-stroke` keeps the highlighted border visually consistent while zooming.
+
+Animations honor the browser/operating-system `prefers-reduced-motion` setting. In reduced-motion mode the zone keeps its active static color and border without blinking or pulsing.
+
 Rules are evaluated in this order:
 
 1. missing, `unknown`, or `unavailable` entity state → `unavailable` style;
 2. first exact matching entry in `states` → that rule's style;
 3. no matching rule → `default` fallback style.
 
-The visual editor provides **Add state** and **Delete** controls and does not impose a limit on the number of state rules.
+The visual editor provides **Add state** and **Delete** controls and does not impose a limit on the number of state rules. Each row also includes an **Effect** selector and a **Highlight border** flag.
 
 Newly drawn zones start with `off` and `on` rules as a convenience for binary entities, but they can be edited, removed, or replaced with any values.
 
@@ -186,7 +204,7 @@ off:
   opacity: 0.08
 ```
 
-are normalized internally to `states` rules. No manual migration is required.
+are normalized internally to `states` rules. Existing state rules that do not contain the new fields behave as `effect: none` and `highlight_border: false`, so no manual migration is required.
 
 ## Example configuration
 
@@ -220,12 +238,18 @@ zones:
       - value: "idle"
         color: "#808080"
         opacity: 0.15
+        effect: none
+        highlight_border: false
       - value: "running"
         color: "#00c853"
         opacity: 0.45
+        effect: none
+        highlight_border: false
       - value: "alarm"
         color: "#ff0000"
         opacity: 0.65
+        effect: blink
+        highlight_border: true
     default:
       color: "#808080"
       opacity: 0.10
@@ -298,6 +322,8 @@ dist/ha-floorplan-zone-card.js
 - [x] Native Home Assistant image upload/media selector
 - [x] Native unrestricted entity selector
 - [x] Unlimited exact-state color/opacity rules
+- [x] Per-state pulse/blink effects
+- [x] Per-state active-border highlighting
 - [x] Fallback and unavailable styles
 - [x] Native Home Assistant zone action selectors
 - [x] Runtime tap / hold / double tap actions
