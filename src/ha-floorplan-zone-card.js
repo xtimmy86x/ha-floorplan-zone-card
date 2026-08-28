@@ -2,7 +2,7 @@ const CARD_TYPE = "floorplan-zone-card";
 const CARD_TAG = "floorplan-zone-card";
 const EDITOR_TAG = "floorplan-zone-card-editor";
 const CANVAS_TAG = "floorplan-zone-canvas";
-const VERSION = "0.1.0-dev.12";
+const VERSION = "0.1.0";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const SVG_SIZE = 1000;
 

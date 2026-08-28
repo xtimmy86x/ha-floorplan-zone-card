@@ -17,10 +17,28 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 9. optionally add state-triggered auto-zoom rules that focus a zone or a custom area;
 10. save the card in the normal Home Assistant dashboard editor.
 
-> [!IMPORTANT]
-> This repository is in active early development. The editor supports Home Assistant-native image/media, entity and action selectors, graphical polygon editing, direct SVG-object zones, unlimited exact-state styling rules with optional visual effects, configurable zone labels, per-zone interactions, and synchronized floorplan zoom/pan.
+> [!NOTE]
+> **0.1.0 is the first public release.** The card is configured through Home Assistant's visual dashboard editor and supports both manually drawn polygon zones and existing SVG objects as interactive zones.
 
-## Current development scope
+## Installation
+
+### HACS
+
+1. Open **HACS → Dashboard**.
+2. Add `https://github.com/xtimmy86x/ha-floorplan-zone-card` as a **custom repository** with category **Dashboard**.
+3. Install **Floorplan Zone Card**.
+4. Reload the browser if Home Assistant asks you to. HACS manages the dashboard resource automatically.
+
+### Manual installation
+
+1. Download `ha-floorplan-zone-card.js` from the latest GitHub release.
+2. Copy it to `/config/www/ha-floorplan-zone-card.js`.
+3. In **Settings → Dashboards → Resources**, add `/local/ha-floorplan-zone-card.js` as a **JavaScript module**.
+4. Reload the browser.
+
+Then add **Floorplan Zone Card** from the normal dashboard card picker and configure it visually.
+
+## Features
 
 - Home Assistant custom card registration through `window.customCards`.
 - Native graphical card editor through `getConfigElement()` and `config-changed`.
@@ -368,7 +386,7 @@ When a zone is in **Edit shape** mode:
 
 ## Development
 
-Requires Node.js 22 or newer. There are no runtime or build dependencies in the current development version.
+Development requires Node.js 22 or newer. The card itself has no runtime dependencies.
 
 ```bash
 npm test
