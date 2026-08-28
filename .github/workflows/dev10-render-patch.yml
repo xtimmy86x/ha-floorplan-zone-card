@@ -1,0 +1,223 @@
+name: Apply dev.10 zoom rendering patch
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/dev10-render-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Apply high-quality zoom rendering changes
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          import json
+
+          path = Path("src/ha-floorplan-zone-card.js")
+          source = path.read_text()
+
+          def replace_once(old, new, label):
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              source = source.replace(old, new, 1)
+
+          replace_once(
+              'const VERSION = "0.1.0-dev.9";',
+              'const VERSION = "0.1.0-dev.10";',
+              "version",
+          )
+
+          replace_once(
+              '''    this._resolvedImage = "";
+              this._imageResolveToken = 0;''',
+              '''    this._resolvedImage = "";
+              this._imageAspectRatio = null;
+              this._imageResolveToken = 0;''',
+              "image aspect state",
+          )
+
+          replace_once(
+              '''    const { scale, centerX, centerY } = this._view;
+              const panX = width / 2 - centerX * width * scale;
+              const panY = height / 2 - centerY * height * scale;
+              transform.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+              transform.style.transformOrigin = "0 0";
+              transform.querySelectorAll("[data-screen-radius]").forEach((node) => {
+                const baseRadius = Number(node.dataset.screenRadius);
+                if (Number.isFinite(baseRadius)) node.setAttribute("r", String(baseRadius / scale));
+              });
+              transform.style.setProperty("--label-counter-scale", String(1 / scale));''',
+              '''    const { scale, centerX, centerY } = this._view;
+              const panX = width / 2 - centerX * width * scale;
+              const panY = height / 2 - centerY * height * scale;
+              // Resize the render layer to the requested zoom instead of scaling a
+              // pre-rasterized 100% texture. This lets the browser sample the original
+              // floorplan image at the final CSS size and keeps raster plans sharper.
+              transform.style.width = `${scale * 100}%`;
+              transform.style.height = `${scale * 100}%`;
+              transform.style.transform = `translate(${panX}px, ${panY}px)`;
+              transform.querySelectorAll("[data-screen-radius]").forEach((node) => {
+                const baseRadius = Number(node.dataset.screenRadius);
+                if (Number.isFinite(baseRadius)) node.setAttribute("r", String(baseRadius / scale));
+              });
+              // HTML labels are positioned by the enlarged layout layer but are no
+              // longer themselves scaled, so they remain readable without counter-scale.
+              transform.style.setProperty("--label-counter-scale", "1");''',
+              "view rendering",
+          )
+
+          replace_once(
+              '''      .canvas { position:relative; overflow:hidden; border-radius:var(--ha-card-border-radius,12px); background:var(--secondary-background-color,#eee); touch-action:none; }
+              .transform-layer { position:relative; width:100%; will-change:transform; }
+              .transform-layer.view-animated { transition:transform ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1); }
+              .transform-layer.empty { aspect-ratio:16/9; min-height:220px; }
+              img { display:block; width:100%; height:auto; user-select:none; pointer-events:none; }''',
+              '''      .canvas { position:relative; overflow:hidden; border-radius:var(--ha-card-border-radius,12px); background:var(--secondary-background-color,#eee); touch-action:none; aspect-ratio:16/9; }
+              .canvas.empty-canvas { min-height:220px; }
+              .transform-layer { position:absolute; left:0; top:0; width:100%; height:100%; }
+              .transform-layer.view-animated { transition:transform ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1),width ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1),height ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1); }
+              .floorplan-image { display:block; width:100%; height:100%; image-rendering:auto; user-select:none; pointer-events:none; }''',
+              "canvas css",
+          )
+
+          replace_once(
+              '''    const container = document.createElement("div");
+              container.className = "canvas";
+              container.addEventListener("wheel", (event) => this.handleWheel(event), { passive: false });''',
+              '''    const container = document.createElement("div");
+              container.className = "canvas";
+              container.style.aspectRatio = this._imageAspectRatio
+                ? String(this._imageAspectRatio)
+                : "16 / 9";
+              container.addEventListener("wheel", (event) => this.handleWheel(event), { passive: false });''',
+              "container aspect ratio",
+          )
+
+          replace_once(
+              '''    if (this._resolvedImage) {
+              const img = document.createElement("img");
+              img.src = this._resolvedImage;
+              img.alt = this._config?.title || "Floorplan";
+              img.addEventListener("load", () => this.applyCurrentView());
+              transform.append(img);
+            } else {
+              transform.classList.add("empty");''',
+              '''    if (this._resolvedImage) {
+              const img = document.createElement("img");
+              img.className = "floorplan-image";
+              img.src = this._resolvedImage;
+              img.alt = this._config?.title || "Floorplan";
+              img.addEventListener("load", () => {
+                if (img.naturalWidth && img.naturalHeight) {
+                  this._imageAspectRatio = img.naturalWidth / img.naturalHeight;
+                  container.style.aspectRatio = String(this._imageAspectRatio);
+                }
+                this.applyCurrentView();
+              });
+              transform.append(img);
+            } else {
+              container.classList.add("empty-canvas");
+              transform.classList.add("empty");''',
+              "image rendering",
+          )
+
+          replace_once(
+              '''    if (!key) {
+              this._imageKey = "";
+              this._resolvedImage = "";
+              this._imageResolveToken += 1;''',
+              '''    if (!key) {
+              this._imageKey = "";
+              this._resolvedImage = "";
+              this._imageAspectRatio = null;
+              this._imageResolveToken += 1;''',
+              "clear image aspect ratio",
+          )
+
+          replace_once(
+              '''    this._imageKey = key;
+              const token = ++this._imageResolveToken;''',
+              '''    if (key !== this._imageKey) this._imageAspectRatio = null;
+              this._imageKey = key;
+              const token = ++this._imageResolveToken;''',
+              "reset changed image aspect ratio",
+          )
+
+          path.write_text(source)
+
+          package_path = Path("package.json")
+          package = json.loads(package_path.read_text())
+          package["version"] = "0.1.0-dev.10"
+          package_path.write_text(json.dumps(package, indent=2) + "\n")
+
+          notes = '''# 0.1.0-dev.10 implementation notes
+
+Fix: preserve floorplan image quality while zooming.
+
+Implemented:
+- raster floorplans are resized at the requested CSS zoom size instead of scaling a pre-rasterized 100% transform texture;
+- pan remains transform-based, while zoom is represented by render-layer width/height;
+- removed permanent `will-change: transform` promotion from the floorplan render layer;
+- the canvas keeps the source image aspect ratio using the image's intrinsic dimensions;
+- SVG zones, normalized coordinates, pointer math, pinch/wheel zoom and auto-zoom keep the existing view model;
+- editor vertex/draft handle radii stay screen-sized while zooming;
+- HTML zone labels stay screen-sized naturally and no longer need inverse transform scaling;
+- auto-zoom animates translation and render-layer dimensions together;
+- no YAML migration or configuration change is required.
+
+Validation:
+- `npm run check`;
+- `npm run build`;
+- source/distribution bundle identity check;
+- regression assertion that raster zoom no longer uses `scale()` on the shared render layer.
+'''
+          Path("DEV10_NOTES.md").write_text(notes)
+
+          test_path = Path("tests/core.test.mjs")
+          tests = test_path.read_text()
+          marker = 'test("raster zoom uses layout sizing instead of transform scaling"'
+          if marker not in tests:
+              tests += '''\n\ntest("raster zoom uses layout sizing instead of transform scaling", async () => {
+              const source = await readFile(new URL("../src/ha-floorplan-zone-card.js", import.meta.url), "utf8");
+              assert.doesNotMatch(source, /will-change:transform/);
+              assert.match(source, /transform\\.style\\.width = `\\$\\{scale \\* 100\\}%`/);
+              assert.match(source, /transform\\.style\\.height = `\\$\\{scale \\* 100\\}%`/);
+              assert.match(source, /transform\\.style\\.transform = `translate\\(\\$\\{panX\\}px, \\$\\{panY\\}px\\)`/);
+              assert.doesNotMatch(source, /translate\\(\\$\\{panX\\}px, \\$\\{panY\\}px\\) scale\\(\\$\\{scale\\}\\)/);
+            });\n'''
+              test_path.write_text(tests)
+          PY
+
+      - name: Validate and build
+        run: |
+          npm run check
+          npm run build
+          cmp src/ha-floorplan-zone-card.js dist/ha-floorplan-zone-card.js
+
+      - name: Commit dev.10
+        shell: bash
+        run: |
+          rm .github/workflows/dev10-render-patch.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/ha-floorplan-zone-card.js dist/ha-floorplan-zone-card.js package.json tests/core.test.mjs DEV10_NOTES.md .github/workflows/dev10-render-patch.yml
+          git commit -m "fix(zoom): preserve floorplan image quality"
+          git push
