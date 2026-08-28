@@ -40,6 +40,9 @@ async function loadCore() {
     polygonCentroid,
     zoneLabelPoint,
     zoneLabelLines,
+    normalizeSvgBounds,
+    svgBoundsValid,
+    zoneUsesSvgObject,
     stateRuleValidation,
     normalizedConfig,
     stateStyle,
@@ -239,4 +242,44 @@ test("raster zoom uses layout sizing instead of transform scaling", async () => 
   assert.match(source, /transform\.style\.height = `\$\{scale \* 100\}%`/);
   assert.match(source, /transform\.style\.transform = `translate\(\$\{panX\}px, \$\{panY\}px\)`/);
   assert.doesNotMatch(source, /translate\(\$\{panX\}px, \$\{panY\}px\) scale\(\$\{scale\}\)/);
+});
+
+
+test("normalizes SVG object zones and uses their bounds for focus and labels", () => {
+  const config = core.normalizedConfig({
+    zones: [{
+      id: "zone_svg",
+      svg_element_id: "room_kitchen",
+      svg_bounds: { x: 0.1, y: 0.2, width: 0.3, height: 0.4 },
+    }],
+  });
+  const zone = config.zones[0];
+  assert.equal(zone.geometry, "svg");
+  assert.equal(zone.svg_element_id, "room_kitchen");
+  assert.deepEqual(structuredClone(core.zoneFocusArea(zone)), {
+    x: 0.1, y: 0.2, width: 0.3, height: 0.4,
+  });
+  assert.deepEqual(structuredClone(core.zoneLabelPoint(zone)), { x: 0.25, y: 0.4 });
+  assert.equal(core.zoneUsesSvgObject(zone), true);
+});
+
+test("legacy drawn zones remain polygon geometry", () => {
+  const zone = core.normalizedConfig({
+    zones: [{
+      id: "zone_1",
+      points: [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 0, y: 1 }],
+    }],
+  }).zones[0];
+  assert.equal(zone.geometry, "polygon");
+  assert.equal(core.zoneUsesSvgObject(zone), false);
+  assert.equal(zone.svg_element_id, undefined);
+});
+
+test("SVG bounds are clamped to normalized floorplan coordinates", () => {
+  const bounds = structuredClone(core.normalizeSvgBounds({ x: -1, y: 0.8, width: 2, height: 1 }));
+  assert.equal(bounds.x, 0);
+  assert.equal(bounds.y, 0.8);
+  assert.equal(bounds.width, 1);
+  assert.ok(Math.abs(bounds.height - 0.2) < 1e-12);
+  assert.equal(core.svgBoundsValid({ x: 0.2, y: 0.2, width: 0, height: 0.3 }), false);
 });

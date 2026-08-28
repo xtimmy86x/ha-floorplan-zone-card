@@ -2,7 +2,7 @@ const CARD_TYPE = "floorplan-zone-card";
 const CARD_TAG = "floorplan-zone-card";
 const EDITOR_TAG = "floorplan-zone-card-editor";
 const CANVAS_TAG = "floorplan-zone-canvas";
-const VERSION = "0.1.0-dev.10";
+const VERSION = "0.1.0-dev.11";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const SVG_SIZE = 1000;
 
@@ -30,6 +30,18 @@ const HIGHLIGHT_BORDER_WIDTH = 4;
 const LABEL_CONTENT_MODES = new Set(["name", "custom", "name_state"]);
 const LABEL_POSITION_MODES = new Set(["auto", "custom"]);
 const LABEL_FONT_WEIGHTS = new Set([400, 500, 600, 700]);
+const SVG_SOURCE_SHAPE_TAGS = new Set(["path", "rect", "circle", "ellipse", "polygon", "polyline"]);
+const SVG_SOURCE_CONTAINER_TAGS = new Set(["g", "a", "symbol"]);
+const SVG_SOURCE_SELECTABLE_TAGS = new Set([...SVG_SOURCE_SHAPE_TAGS, "g", "use"]);
+const SVG_SOURCE_BLOCKED_ANCESTORS = new Set(["defs", "clipPath", "mask", "pattern", "marker"]);
+const SVG_SOURCE_ATTRIBUTES = Object.freeze({
+  path: ["d", "pathLength", "transform", "fill-rule", "clip-rule"],
+  rect: ["x", "y", "width", "height", "rx", "ry", "transform"],
+  circle: ["cx", "cy", "r", "transform"],
+  ellipse: ["cx", "cy", "rx", "ry", "transform"],
+  polygon: ["points", "transform", "fill-rule", "clip-rule"],
+  polyline: ["points", "transform", "fill-rule", "clip-rule"],
+});
 const DEFAULT_LABEL = Object.freeze({
   enabled: false,
   content: "name",
@@ -58,6 +70,31 @@ function clamp01(value) {
 
 function normalizePoint(point) {
   return { x: clamp01(point?.x), y: clamp01(point?.y) };
+}
+
+function normalizeSvgBounds(bounds) {
+  const x = clamp01(bounds?.x);
+  const y = clamp01(bounds?.y);
+  return {
+    x,
+    y,
+    width: clamp(bounds?.width ?? 0, 0, 1 - x),
+    height: clamp(bounds?.height ?? 0, 0, 1 - y),
+  };
+}
+
+function svgBoundsValid(bounds) {
+  if (!bounds || typeof bounds !== "object" || Array.isArray(bounds)) return false;
+  const normalized = normalizeSvgBounds(bounds);
+  return normalized.width > 0 && normalized.height > 0;
+}
+
+function zoneUsesSvgObject(zone) {
+  return Boolean(
+    (zone?.geometry === "svg" || zone?.svg_element_id) &&
+    typeof zone?.svg_element_id === "string" &&
+    zone.svg_element_id,
+  );
 }
 
 function normalizeStyle(style, fallback) {
@@ -126,6 +163,13 @@ function zoneLabelPoint(zone) {
   const label = normalizeLabel(zone?.label);
   if (label.position_mode === "custom" && label.position) {
     return normalizePoint(label.position);
+  }
+  if (zoneUsesSvgObject(zone) && svgBoundsValid(zone?.svg_bounds)) {
+    const bounds = normalizeSvgBounds(zone.svg_bounds);
+    return normalizePoint({
+      x: bounds.x + bounds.width / 2,
+      y: bounds.y + bounds.height / 2,
+    });
   }
   return polygonCentroid(zone?.points);
 }
@@ -237,6 +281,9 @@ function normalizeAutoZoomRule(rule) {
 }
 
 function zoneFocusArea(zone) {
+  if (zoneUsesSvgObject(zone) && svgBoundsValid(zone?.svg_bounds)) {
+    return normalizeSvgBounds(zone.svg_bounds);
+  }
   if (!Array.isArray(zone?.points) || zone.points.length < 3) return null;
   const xs = zone.points.map((point) => clamp01(point.x));
   const ys = zone.points.map((point) => clamp01(point.y));
@@ -311,8 +358,15 @@ function legacyStateRules(zone) {
 }
 
 function normalizeZone(zone) {
+  const svgElementId = typeof zone?.svg_element_id === "string" ? zone.svg_element_id : "";
+  const geometry = zone?.geometry === "svg" || svgElementId ? "svg" : "polygon";
   const normalized = {
     ...zone,
+    geometry,
+    svg_element_id: geometry === "svg" ? svgElementId : undefined,
+    svg_bounds: geometry === "svg" && svgBoundsValid(zone?.svg_bounds)
+      ? normalizeSvgBounds(zone.svg_bounds)
+      : undefined,
     points: Array.isArray(zone?.points) ? zone.points.map(normalizePoint) : [],
     states: Array.isArray(zone?.states)
       ? zone.states.map(normalizeStateRule)
@@ -330,6 +384,10 @@ function normalizeZone(zone) {
     double_tap_action: normalizeAction(zone?.double_tap_action),
     label: normalizeLabel(zone?.label),
   };
+  if (geometry !== "svg") {
+    delete normalized.svg_element_id;
+    delete normalized.svg_bounds;
+  }
   delete normalized.on;
   delete normalized.off;
   return normalized;
@@ -360,7 +418,35 @@ function createZone(points, zones) {
     id,
     name: `Zone ${number}`,
     entity: "",
+    geometry: "polygon",
     points: points.map(normalizePoint),
+    states: [
+      { value: "off", ...DEFAULT_OFF_STYLE, effect: "none", highlight_border: false },
+      { value: "on", ...DEFAULT_ON_STYLE, effect: "none", highlight_border: false },
+    ],
+    default: { ...DEFAULT_FALLBACK_STYLE },
+    unavailable: { ...DEFAULT_UNAVAILABLE_STYLE },
+    stroke: { ...DEFAULT_STROKE },
+    tap_action: { ...DEFAULT_TAP_ACTION },
+    hold_action: { ...DEFAULT_NONE_ACTION },
+    double_tap_action: { ...DEFAULT_NONE_ACTION },
+    label: { ...DEFAULT_LABEL },
+  };
+}
+
+function createSvgZone(element, bounds, zones) {
+  const id = nextZoneId(zones);
+  const number = id.replace(/^zone_/, "");
+  const elementId = typeof element?.id === "string" ? element.id : "";
+  const title = typeof element?.title === "string" ? element.title.trim() : "";
+  return {
+    id,
+    name: title || elementId || `SVG Zone ${number}`,
+    entity: "",
+    geometry: "svg",
+    svg_element_id: elementId,
+    svg_bounds: svgBoundsValid(bounds) ? normalizeSvgBounds(bounds) : undefined,
+    points: [],
     states: [
       { value: "off", ...DEFAULT_OFF_STYLE, effect: "none", highlight_border: false },
       { value: "on", ...DEFAULT_ON_STYLE, effect: "none", highlight_border: false },
@@ -426,6 +512,198 @@ async function resolveImageSource(hass, image) {
   return hassUrl(hass, resolved?.url ?? "");
 }
 
+
+function parseSvgNumericLength(value) {
+  if (typeof value !== "string") return null;
+  const match = value.trim().match(/^(-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)(?:px)?$/i);
+  if (!match) return null;
+  const number = Number(match[1]);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function svgSourceElementTitle(element) {
+  for (const child of element?.children ?? []) {
+    if (child.localName === "title") return child.textContent?.trim() ?? "";
+  }
+  return "";
+}
+
+function svgSourceElementBlocked(element, root) {
+  let current = element?.parentElement;
+  while (current && current !== root) {
+    if (SVG_SOURCE_BLOCKED_ANCESTORS.has(current.localName)) return true;
+    if (current.localName === "svg") return true;
+    current = current.parentElement;
+  }
+  return false;
+}
+
+function svgSourceHasGeometry(element, elementsById, seen = new Set()) {
+  if (!element || seen.has(element)) return false;
+  seen.add(element);
+  const tag = element.localName;
+  if (SVG_SOURCE_SHAPE_TAGS.has(tag)) return true;
+  if (tag === "use") {
+    const href = element.getAttribute("href") || element.getAttribute("xlink:href") || "";
+    if (!href.startsWith("#")) return false;
+    return svgSourceHasGeometry(elementsById.get(href.slice(1)), elementsById, seen);
+  }
+  if (!SVG_SOURCE_CONTAINER_TAGS.has(tag)) return false;
+  return [...(element.children ?? [])].some((child) =>
+    svgSourceHasGeometry(child, elementsById, new Set(seen))
+  );
+}
+
+function parseSvgSource(text) {
+  if (typeof DOMParser === "undefined" || typeof text !== "string") return null;
+  const parsed = new DOMParser().parseFromString(text, "image/svg+xml");
+  const root = parsed?.documentElement;
+  if (!root || root.localName !== "svg" || parsed.querySelector("parsererror")) return null;
+
+  const rawViewBox = root.getAttribute("viewBox")?.trim() ?? "";
+  const viewBoxParts = rawViewBox
+    .split(/[\s,]+/)
+    .map(Number)
+    .filter((value) => Number.isFinite(value));
+  const width = parseSvgNumericLength(root.getAttribute("width"));
+  const height = parseSvgNumericLength(root.getAttribute("height"));
+  let viewBox;
+  let aspectRatio;
+  if (viewBoxParts.length === 4 && viewBoxParts[2] > 0 && viewBoxParts[3] > 0) {
+    viewBox = viewBoxParts.join(" ");
+    aspectRatio = width && height ? width / height : viewBoxParts[2] / viewBoxParts[3];
+  } else if (width && height) {
+    viewBox = `0 0 ${width} ${height}`;
+    aspectRatio = width / height;
+  } else {
+    viewBox = `0 0 ${SVG_SIZE} ${SVG_SIZE}`;
+    aspectRatio = 1;
+  }
+
+  const elementsById = new Map();
+  root.querySelectorAll("[id]").forEach((element) => {
+    const id = element.getAttribute("id")?.trim();
+    if (id && !elementsById.has(id)) elementsById.set(id, element);
+  });
+
+  const entries = [];
+  elementsById.forEach((element, id) => {
+    if (!SVG_SOURCE_SELECTABLE_TAGS.has(element.localName)) return;
+    if (svgSourceElementBlocked(element, root)) return;
+    if (!svgSourceHasGeometry(element, elementsById)) return;
+    entries.push({
+      id,
+      tag: element.localName,
+      title: svgSourceElementTitle(element),
+    });
+  });
+  entries.sort((a, b) => a.id.localeCompare(b.id));
+
+  return {
+    document: parsed,
+    root,
+    elementsById,
+    entries,
+    viewBox,
+    preserveAspectRatio: root.getAttribute("preserveAspectRatio") || "xMidYMid meet",
+    aspectRatio,
+  };
+}
+
+function copySvgGeometryAttributes(sourceElement, targetElement) {
+  const attributes = SVG_SOURCE_ATTRIBUTES[sourceElement.localName] ?? [];
+  attributes.forEach((name) => {
+    const value = sourceElement.getAttribute(name);
+    if (value !== null) targetElement.setAttribute(name, value);
+  });
+}
+
+function cloneSvgGeometryNode(sourceElement, descriptor, seen = new Set()) {
+  if (!sourceElement || seen.has(sourceElement)) return null;
+  seen.add(sourceElement);
+  const tag = sourceElement.localName;
+
+  if (SVG_SOURCE_SHAPE_TAGS.has(tag)) {
+    const clone = document.createElementNS(SVG_NS, tag);
+    copySvgGeometryAttributes(sourceElement, clone);
+    return clone;
+  }
+
+  if (tag === "use") {
+    const href = sourceElement.getAttribute("href") || sourceElement.getAttribute("xlink:href") || "";
+    if (!href.startsWith("#")) return null;
+    const target = descriptor.elementsById.get(href.slice(1));
+    const resolved = cloneSvgGeometryNode(target, descriptor, new Set(seen));
+    if (!resolved) return null;
+    const transformed = document.createElementNS(SVG_NS, "g");
+    const transform = sourceElement.getAttribute("transform");
+    if (transform) transformed.setAttribute("transform", transform);
+    const x = sourceElement.getAttribute("x");
+    const y = sourceElement.getAttribute("y");
+    if (x || y) {
+      const placement = document.createElementNS(SVG_NS, "g");
+      placement.setAttribute("transform", `translate(${x || 0} ${y || 0})`);
+      placement.append(resolved);
+      transformed.append(placement);
+    } else {
+      transformed.append(resolved);
+    }
+    return transformed;
+  }
+
+  if (!SVG_SOURCE_CONTAINER_TAGS.has(tag)) return null;
+  const group = document.createElementNS(SVG_NS, "g");
+  const transform = sourceElement.getAttribute("transform");
+  if (transform) group.setAttribute("transform", transform);
+  for (const child of sourceElement.children ?? []) {
+    const clone = cloneSvgGeometryNode(child, descriptor, new Set(seen));
+    if (clone) group.append(clone);
+  }
+  return group.childElementCount ? group : null;
+}
+
+function cloneSvgSourceObject(sourceElement, descriptor) {
+  const geometry = cloneSvgGeometryNode(sourceElement, descriptor);
+  if (!geometry) return null;
+
+  const ancestors = [];
+  let current = sourceElement.parentElement;
+  while (current && current !== descriptor.root) {
+    if (current.localName === "svg") return null;
+    if (SVG_SOURCE_CONTAINER_TAGS.has(current.localName)) ancestors.unshift(current);
+    current = current.parentElement;
+  }
+
+  let wrapped = geometry;
+  for (let index = ancestors.length - 1; index >= 0; index -= 1) {
+    const transform = ancestors[index].getAttribute("transform");
+    if (!transform) continue;
+    const group = document.createElementNS(SVG_NS, "g");
+    group.setAttribute("transform", transform);
+    group.append(wrapped);
+    wrapped = group;
+  }
+
+  const rootTransform = descriptor.root.getAttribute("transform");
+  if (rootTransform) {
+    const group = document.createElementNS(SVG_NS, "g");
+    group.setAttribute("transform", rootTransform);
+    group.append(wrapped);
+    wrapped = group;
+  }
+  return wrapped;
+}
+
+function likelySvgSource(image, resolvedUrl, zones = []) {
+  const configured = imageContentId(image);
+  return (
+    /\.svg(?:$|[?#])/i.test(configured) ||
+    /\.svg(?:$|[?#])/i.test(resolvedUrl ?? "") ||
+    isMediaSourceContentId(configured) ||
+    zones.some(zoneUsesSvgObject)
+  );
+}
+
 function effectiveAction(zone, actionName) {
   const configured = normalizeAction(zone?.[actionName]);
   if (configured) return configured;
@@ -484,6 +762,11 @@ class FloorplanZoneCanvas extends HTMLElement {
     this._resolvedImage = "";
     this._imageAspectRatio = null;
     this._imageResolveToken = 0;
+    this._svgSourceKey = "";
+    this._svgSource = null;
+    this._svgSourceStatus = "idle";
+    this._svgSourceError = "";
+    this._svgSourceToken = 0;
     this._viewTransitionTimer = null;
     this._resizeObserver = typeof ResizeObserver !== "undefined"
       ? new ResizeObserver(() => this.applyCurrentView())
@@ -1188,6 +1471,147 @@ class FloorplanZoneCanvas extends HTMLElement {
     container.append(controls);
   }
 
+
+  clearSvgSource() {
+    this._svgSourceToken += 1;
+    this._svgSourceKey = "";
+    this._svgSource = null;
+    this._svgSourceStatus = "idle";
+    this._svgSourceError = "";
+  }
+
+  emitSvgSourceChanged() {
+    const entries = (this._svgSource?.entries ?? []).map((entry) => ({
+      ...entry,
+      bounds: this.svgElementBounds(entry.id) ?? undefined,
+    }));
+    this.dispatchEvent(
+      new CustomEvent("floorplan-svg-source-changed", {
+        bubbles: true,
+        composed: true,
+        detail: {
+          status: this._svgSourceStatus,
+          error: this._svgSourceError,
+          elements: entries,
+        },
+      }),
+    );
+  }
+
+  async refreshSvgSource() {
+    const url = this._resolvedImage;
+    if (!url) {
+      this.clearSvgSource();
+      this.emitSvgSourceChanged();
+      return;
+    }
+    if (this._svgSourceKey === url && ["loading", "ready", "none", "error"].includes(this._svgSourceStatus)) {
+      return;
+    }
+    this._svgSourceKey = url;
+    this._svgSourceStatus = "loading";
+    this._svgSourceError = "";
+    const token = ++this._svgSourceToken;
+
+    if (!likelySvgSource(this._config?.image, url, this._config?.zones ?? [])) {
+      this._svgSourceStatus = "none";
+      this.emitSvgSourceChanged();
+      return;
+    }
+
+    try {
+      const response = await fetch(url, { credentials: "same-origin", cache: "force-cache" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const contentType = response.headers.get("content-type") ?? "";
+      const explicitlySvg = /\.svg(?:$|[?#])/i.test(url) || /\.svg(?:$|[?#])/i.test(imageContentId(this._config?.image));
+      const requiredByConfig = (this._config?.zones ?? []).some(zoneUsesSvgObject);
+      if (!contentType.toLowerCase().includes("svg") && !explicitlySvg && !requiredByConfig) {
+        if (token !== this._svgSourceToken) return;
+        this._svgSourceStatus = "none";
+        this.emitSvgSourceChanged();
+        return;
+      }
+      const parsed = parseSvgSource(await response.text());
+      if (!parsed) throw new Error("The selected image is not a readable SVG document.");
+      if (token !== this._svgSourceToken || url !== this._svgSourceKey) return;
+      this._svgSource = parsed;
+      this._svgSourceStatus = "ready";
+      this._svgSourceError = "";
+      if (Number.isFinite(parsed.aspectRatio) && parsed.aspectRatio > 0) {
+        this._imageAspectRatio = parsed.aspectRatio;
+      }
+      this.render();
+      requestAnimationFrame(() => this.emitSvgSourceChanged());
+    } catch (error) {
+      if (token !== this._svgSourceToken || url !== this._svgSourceKey) return;
+      this._svgSource = null;
+      this._svgSourceStatus = "error";
+      this._svgSourceError = error instanceof Error ? error.message : String(error);
+      if ((this._config?.zones ?? []).some(zoneUsesSvgObject)) {
+        console.warn("Floorplan Zone Card: unable to inspect SVG floorplan objects", error);
+      }
+      this.render();
+      this.emitSvgSourceChanged();
+    }
+  }
+
+  createSvgSourceLayer(overlay) {
+    if (!this._svgSource) return null;
+    const layer = document.createElementNS(SVG_NS, "svg");
+    layer.classList.add("svg-source-layer");
+    layer.setAttribute("x", "0");
+    layer.setAttribute("y", "0");
+    layer.setAttribute("width", String(SVG_SIZE));
+    layer.setAttribute("height", String(SVG_SIZE));
+    layer.setAttribute("viewBox", this._svgSource.viewBox);
+    layer.setAttribute("preserveAspectRatio", this._svgSource.preserveAspectRatio);
+    layer.setAttribute("pointer-events", "none");
+    overlay.append(layer);
+    return layer;
+  }
+
+  createSvgZoneShape(zone, sourceLayer) {
+    if (!sourceLayer || !this._svgSource || !zoneUsesSvgObject(zone)) return null;
+    const sourceElement = this._svgSource.elementsById.get(zone.svg_element_id);
+    if (!sourceElement) return null;
+    const geometry = cloneSvgSourceObject(sourceElement, this._svgSource);
+    if (!geometry) return null;
+    const wrapper = document.createElementNS(SVG_NS, "g");
+    wrapper.classList.add("zone", "svg-source-zone");
+    wrapper.dataset.zoneId = zone.id ?? "";
+    wrapper.dataset.svgElementId = zone.svg_element_id;
+    wrapper.setAttribute("pointer-events", "visiblePainted");
+    wrapper.append(geometry);
+    sourceLayer.append(wrapper);
+    return wrapper;
+  }
+
+  svgElementBounds(elementId) {
+    if (!this._svgSource || !elementId) return null;
+    const sourceLayer = this.shadowRoot?.querySelector(".svg-source-layer");
+    const sourceElement = this._svgSource.elementsById.get(elementId);
+    if (!sourceLayer || !sourceElement) return null;
+    const geometry = cloneSvgSourceObject(sourceElement, this._svgSource);
+    if (!geometry) return null;
+    const measure = document.createElementNS(SVG_NS, "g");
+    measure.setAttribute("fill", "#000");
+    measure.setAttribute("stroke", "#000");
+    measure.setAttribute("opacity", "0");
+    measure.setAttribute("pointer-events", "none");
+    measure.append(geometry);
+    sourceLayer.append(measure);
+    const rect = measure.getBoundingClientRect();
+    const layerRect = sourceLayer.getBoundingClientRect();
+    measure.remove();
+    if (!rect.width || !rect.height || !layerRect.width || !layerRect.height) return null;
+    return normalizeSvgBounds({
+      x: (rect.left - layerRect.left) / layerRect.width,
+      y: (rect.top - layerRect.top) / layerRect.height,
+      width: rect.width / layerRect.width,
+      height: rect.height / layerRect.height,
+    });
+  }
+
   applyZoneVisualState(polygon, zone) {
     if (!polygon || !zone) return;
     const zoneStyle = stateStyle(this._hass, zone);
@@ -1228,7 +1652,7 @@ class FloorplanZoneCanvas extends HTMLElement {
   }
 
   updateZoneVisualStates() {
-    const polygons = this.shadowRoot?.querySelectorAll("polygon.zone[data-zone-id]");
+    const polygons = this.shadowRoot?.querySelectorAll(".zone[data-zone-id]");
     if (!polygons?.length) return;
     const configuredZones = this._config?.zones ?? [];
     const zonesById = new Map(
@@ -1345,11 +1769,13 @@ class FloorplanZoneCanvas extends HTMLElement {
       .transform-layer { position:absolute; left:0; top:0; width:100%; height:100%; }
       .transform-layer.view-animated { transition:transform ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1),width ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1),height ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1); }
       .floorplan-image { display:block; width:100%; height:100%; image-rendering:auto; user-select:none; pointer-events:none; }
-      svg { position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
-      polygon.zone { vector-effect:non-scaling-stroke; transition:fill 160ms ease,fill-opacity 160ms ease,stroke 120ms ease,stroke-width 120ms ease,filter 80ms ease; }
-      polygon.zone.effect-pulse { animation:zone-pulse 1.4s ease-in-out infinite; }
-      polygon.zone.effect-blink { animation:zone-blink 1s steps(1,end) infinite; }
-      polygon.zone.highlight-border { stroke-linejoin:round; stroke-linecap:round; }
+      .floorplan-overlay { position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
+      .svg-source-layer { overflow:visible; pointer-events:none; }
+      .zone { vector-effect:non-scaling-stroke; transition:fill 160ms ease,fill-opacity 160ms ease,stroke 120ms ease,stroke-width 120ms ease,filter 80ms ease; }
+      .svg-source-zone * { vector-effect:non-scaling-stroke; }
+      .zone.effect-pulse { animation:zone-pulse 1.4s ease-in-out infinite; }
+      .zone.effect-blink { animation:zone-blink 1s steps(1,end) infinite; }
+      .zone.highlight-border { stroke-linejoin:round; stroke-linecap:round; }
       @keyframes zone-pulse {
         0%,100% { fill-opacity:var(--zone-fill-opacity); }
         50% { fill-opacity:var(--zone-effect-low-opacity); }
@@ -1360,13 +1786,13 @@ class FloorplanZoneCanvas extends HTMLElement {
         100% { fill-opacity:var(--zone-fill-opacity); }
       }
       @media (prefers-reduced-motion: reduce) {
-        polygon.zone.effect-pulse,polygon.zone.effect-blink { animation:none; }
+        .zone.effect-pulse,.zone.effect-blink { animation:none; }
       }
-      polygon.actionable { cursor:pointer; pointer-events:auto; }
-      polygon.actionable.pressed { filter:brightness(.88); }
-      polygon.actionable:focus-visible { outline:none; stroke:var(--primary-color,#03a9f4)!important; stroke-width:4!important; }
-      polygon.selectable { cursor:pointer; }
-      polygon.selected { stroke:var(--primary-color,#03a9f4)!important; stroke-width:4!important; }
+      .zone.actionable { cursor:pointer; pointer-events:auto; }
+      .zone.actionable.pressed { filter:brightness(.88); }
+      .zone.actionable:focus-visible { outline:none; stroke:var(--primary-color,#03a9f4)!important; stroke-width:4!important; }
+      .zone.selectable { cursor:pointer; }
+      .zone.selected { stroke:var(--primary-color,#03a9f4)!important; stroke-width:4!important; }
       .draft-line { fill:none; stroke:var(--primary-color,#03a9f4); stroke-width:4; vector-effect:non-scaling-stroke; pointer-events:none; }
       .draft-point,.vertex { fill:var(--primary-color,#03a9f4); stroke:var(--card-background-color,#fff); stroke-width:3; vector-effect:non-scaling-stroke; }
       .focus-area { fill:color-mix(in srgb,var(--primary-color,#03a9f4) 18%,transparent); stroke:var(--primary-color,#03a9f4); stroke-width:3; stroke-dasharray:14 10; vector-effect:non-scaling-stroke; pointer-events:none; }
@@ -1386,7 +1812,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       .zoom-indicator { min-width:48px; text-align:center; color:var(--secondary-text-color,#727272); font-size:12px; font-weight:600; user-select:none; }
       .canvas.zoomed svg { cursor:grab; }
       .canvas.zoomed svg:active { cursor:grabbing; }
-      .canvas.zoomed polygon.actionable { cursor:pointer; }
+      .canvas.zoomed .zone.actionable { cursor:pointer; }
       .zone-label-layer { position:absolute; inset:0; pointer-events:none; }
       .zone-label-anchor { position:absolute; width:0; height:0; pointer-events:none; }
       .zone-label-box { position:absolute; left:0; top:0; transform:translate(-50%,-50%) scale(var(--label-counter-scale,1)); transform-origin:center; display:grid; justify-items:center; gap:1px; min-width:max-content; padding:3px 7px; border-radius:6px; box-sizing:border-box; font-family:var(--ha-card-header-font-family,var(--primary-font-family,sans-serif)); line-height:1.15; text-align:center; white-space:nowrap; user-select:none; transition:box-shadow 120ms ease,outline-color 120ms ease; }
@@ -1439,17 +1865,29 @@ class FloorplanZoneCanvas extends HTMLElement {
     }
 
     const svg = document.createElementNS(SVG_NS, "svg");
+    svg.classList.add("floorplan-overlay");
     svg.setAttribute("viewBox", `0 0 ${SVG_SIZE} ${SVG_SIZE}`);
     svg.setAttribute("preserveAspectRatio", "none");
     svg.setAttribute("aria-label", "Floorplan zones");
 
+    const sourceSvgLayer = this.createSvgSourceLayer(svg);
+
     for (const zone of this._config?.zones ?? []) {
-      if (!Array.isArray(zone.points) || zone.points.length < 3) continue;
-      const polygon = document.createElementNS(SVG_NS, "polygon");
+      const svgObjectZone = zoneUsesSvgObject(zone);
+      let polygon;
+      if (svgObjectZone) {
+        polygon = this.createSvgZoneShape(zone, sourceSvgLayer);
+        if (!polygon) continue;
+      } else {
+        if (!Array.isArray(zone.points) || zone.points.length < 3) continue;
+        polygon = document.createElementNS(SVG_NS, "polygon");
+        polygon.classList.add("zone", "polygon-zone");
+        polygon.dataset.zoneId = zone.id ?? "";
+        polygon.setAttribute("points", pointList(zone.points));
+        svg.append(polygon);
+      }
+
       const accessibleName = zone.name || zone.entity || zone.id || "Zone";
-      polygon.classList.add("zone");
-      polygon.dataset.zoneId = zone.id ?? "";
-      polygon.setAttribute("points", pointList(zone.points));
       this.applyZoneVisualState(polygon, zone);
 
       if (interactive && mode !== "draw" && mode !== "focus-area" && mode !== "label-position") {
@@ -1480,13 +1918,11 @@ class FloorplanZoneCanvas extends HTMLElement {
         polygon.style.pointerEvents = "none";
       }
 
-      if (interactive && zone.id === selectedZoneId && mode === "edit") {
+      if (interactive && zone.id === selectedZoneId && mode === "edit" && !svgObjectZone) {
         polygon.classList.add("selected");
       }
 
-      svg.append(polygon);
-
-      if (interactive && zone.id === selectedZoneId && mode === "edit") {
+      if (interactive && zone.id === selectedZoneId && mode === "edit" && !svgObjectZone) {
         const handles = [];
         const midpointHandles = [];
         zone.points.forEach((point, edgeIndex) => {
@@ -1549,7 +1985,10 @@ class FloorplanZoneCanvas extends HTMLElement {
     labelsLayer.className = "zone-label-layer";
     for (const zone of this._config?.zones ?? []) {
       const label = normalizeLabel(zone.label);
-      if (!label.enabled || !Array.isArray(zone.points) || zone.points.length < 3) continue;
+      const hasGeometry = zoneUsesSvgObject(zone)
+        ? svgBoundsValid(zone.svg_bounds)
+        : Array.isArray(zone.points) && zone.points.length >= 3;
+      if (!label.enabled || !hasGeometry) continue;
       const point = zoneLabelPoint(zone);
       const anchor = document.createElement("div");
       anchor.className = "zone-label-anchor";
@@ -1732,19 +2171,26 @@ class FloorplanZoneCanvas extends HTMLElement {
       this._resolvedImage = "";
       this._imageAspectRatio = null;
       this._imageResolveToken += 1;
+      this.clearSvgSource();
       this.render();
+      this.emitSvgSourceChanged();
       return;
     }
     if (key === this._imageKey && this._resolvedImage) {
       this.render();
+      this.refreshSvgSource();
       return;
     }
-    if (key !== this._imageKey) this._imageAspectRatio = null;
+    if (key !== this._imageKey) {
+      this._imageAspectRatio = null;
+      this.clearSvgSource();
+    }
     this._imageKey = key;
     const token = ++this._imageResolveToken;
     if (!needsResolution) {
       this._resolvedImage = hassUrl(this._hass, key);
       this.render();
+      this.refreshSvgSource();
       return;
     }
     this._resolvedImage = "";
@@ -1760,6 +2206,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       this._resolvedImage = "";
     }
     this.render();
+    this.refreshSvgSource();
   }
 }
 
@@ -1891,11 +2338,20 @@ class FloorplanZoneCardEditor extends HTMLElement {
     this._focusRuleIndex = null;
     this._labelZoneId = null;
     this._viewState = normalizeViewState();
+    this._svgElements = [];
+    this._svgSourceError = "";
+    this._selectedSvgElementId = "";
     this._haFormReadyListener = null;
   }
 
   setConfig(config) {
+    const previousImage = imageContentId(this._config?.image);
     this._config = normalizedConfig(config);
+    if (previousImage !== imageContentId(this._config?.image)) {
+      this._svgElements = [];
+      this._svgSourceError = "";
+      this._selectedSvgElementId = "";
+    }
     const selectedZone = this._config.zones.find((zone) => zone.id === this._selectedZoneId);
     if (!selectedZone) {
       this._selectedZoneId = null;
@@ -1968,13 +2424,79 @@ class FloorplanZoneCardEditor extends HTMLElement {
   }
 
   configureCanvas(canvas) {
+    canvas.addEventListener("floorplan-view-changed", (event) => {
+      this._viewState = normalizeViewState(event.detail?.viewState);
+    });
+    canvas.addEventListener("floorplan-svg-source-changed", (event) => {
+      this.handleSvgSourceChanged(event.detail ?? {});
+    });
     canvas.viewState = this._viewState;
     canvas.config = this._config;
     canvas.hass = this._hass;
     canvas.editorState = this.canvasState();
-    canvas.addEventListener("floorplan-view-changed", (event) => {
-      this._viewState = normalizeViewState(event.detail?.viewState);
+  }
+
+  handleSvgSourceChanged(detail) {
+    const nextElements = Array.isArray(detail?.elements) ? detail.elements : [];
+    const nextError = typeof detail?.error === "string" ? detail.error : "";
+    const previousCatalog = this._svgElements.map((item) => `${item.id}:${item.tag}`).join("|");
+    const nextCatalog = nextElements.map((item) => `${item.id}:${item.tag}`).join("|");
+    this._svgElements = nextElements;
+    this._svgSourceError = nextError;
+
+    const availableIds = new Set(nextElements.map((item) => item.id));
+    if (!availableIds.has(this._selectedSvgElementId)) {
+      const used = this.usedSvgElementIds();
+      this._selectedSvgElementId = nextElements.find((item) => !used.has(item.id))?.id ?? "";
+    }
+
+    let boundsChanged = false;
+    const byId = new Map(nextElements.map((item) => [item.id, item]));
+    const zones = deepClone(this._config?.zones ?? []);
+    zones.forEach((zone, index) => {
+      if (!zoneUsesSvgObject(zone)) return;
+      const bounds = byId.get(zone.svg_element_id)?.bounds;
+      if (!svgBoundsValid(bounds)) return;
+      const normalized = normalizeSvgBounds(bounds);
+      const current = svgBoundsValid(zone.svg_bounds) ? normalizeSvgBounds(zone.svg_bounds) : null;
+      const differs = !current || ["x", "y", "width", "height"].some(
+        (key) => Math.abs(current[key] - normalized[key]) > 0.0005,
+      );
+      if (!differs) return;
+      zones[index] = normalizeZone({ ...zone, svg_bounds: normalized });
+      boundsChanged = true;
     });
+    if (boundsChanged) {
+      this._config = { ...this._config, zones };
+      this.emitConfigChanged();
+    }
+
+    if (previousCatalog !== nextCatalog || nextError !== (this._lastSvgSourceError ?? "") || boundsChanged) {
+      this._lastSvgSourceError = nextError;
+      this.render();
+    }
+  }
+
+  usedSvgElementIds(excludeZoneId = null) {
+    return new Set(
+      (this._config?.zones ?? [])
+        .filter((zone) => zone.id !== excludeZoneId && zoneUsesSvgObject(zone))
+        .map((zone) => zone.svg_element_id),
+    );
+  }
+
+  addSvgObjectZone(elementId) {
+    const element = this._svgElements.find((item) => item.id === elementId);
+    if (!element || this.usedSvgElementIds().has(elementId)) return;
+    const zone = createSvgZone(element, element.bounds, this._config?.zones ?? []);
+    this._config = { ...this._config, zones: [...(this._config?.zones ?? []), zone] };
+    this._selectedZoneId = zone.id;
+    this._selectedVertexIndex = null;
+    this._mode = "select";
+    const used = this.usedSvgElementIds();
+    this._selectedSvgElementId = this._svgElements.find((item) => !used.has(item.id))?.id ?? "";
+    this.emitConfigChanged();
+    this.render();
   }
 
   updatePreview() {
@@ -2066,12 +2588,13 @@ class FloorplanZoneCardEditor extends HTMLElement {
   }
 
   selectZone(zoneId) {
-    if (!this._config?.zones?.some((zone) => zone.id === zoneId)) return;
+    const zone = this._config?.zones?.find((item) => item.id === zoneId);
+    if (!zone) return;
     this._selectedZoneId = zoneId;
     this._selectedVertexIndex = null;
     this._focusRuleIndex = null;
     this._labelZoneId = null;
-    this._mode = "edit";
+    this._mode = zoneUsesSvgObject(zone) ? "select" : "edit";
     this._draftPoints = [];
     this.render();
   }
@@ -2365,6 +2888,58 @@ class FloorplanZoneCardEditor extends HTMLElement {
       }));
     });
     return form;
+  }
+
+
+  createSvgGeometryEditor(zone, zoneIndex) {
+    const section = document.createElement("div");
+    section.className = "svg-geometry-editor";
+    const heading = document.createElement("strong");
+    heading.textContent = "SVG object";
+    section.append(heading);
+
+    const used = this.usedSvgElementIds(zone.id);
+    const options = this._svgElements
+      .filter((item) => !used.has(item.id) || item.id === zone.svg_element_id)
+      .map((item) => ({
+        value: item.id,
+        label: `${item.id} · <${item.tag}>${item.title ? ` · ${item.title}` : ""}`,
+      }));
+    if (!options.some((item) => item.value === zone.svg_element_id)) {
+      options.unshift({ value: zone.svg_element_id, label: `${zone.svg_element_id} · not found in current SVG` });
+    }
+
+    section.append(this.createField("Source object", this.createSelect(
+      zone.svg_element_id,
+      options,
+      (elementId) => {
+        const element = this._svgElements.find((item) => item.id === elementId);
+        this.updateZone(zoneIndex, (current) => ({
+          ...current,
+          geometry: "svg",
+          svg_element_id: elementId,
+          svg_bounds: svgBoundsValid(element?.bounds) ? normalizeSvgBounds(element.bounds) : current.svg_bounds,
+        }), true);
+      },
+    )));
+
+    const hint = document.createElement("p");
+    hint.className = "hint";
+    hint.textContent = "This zone uses the geometry of an existing SVG element. Its state styles, effects, actions, labels and auto-zoom work exactly like a drawn zone.";
+    section.append(hint);
+
+    if (this._svgSourceError) {
+      const warning = document.createElement("p");
+      warning.className = "validation-warning";
+      warning.textContent = `Unable to inspect the SVG source: ${this._svgSourceError}`;
+      section.append(warning);
+    } else if (!this._svgElements.some((item) => item.id === zone.svg_element_id)) {
+      const warning = document.createElement("p");
+      warning.className = "validation-warning";
+      warning.textContent = `SVG object #${zone.svg_element_id} is not present in the current floorplan.`;
+      section.append(warning);
+    }
+    return section;
   }
 
   createActionsEditor(zone, zoneIndex) {
@@ -2882,7 +3457,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
     const style = document.createElement("style");
     style.textContent = `
       :host { display:block; }
-      .editor,.zones,.zone-card,.field,.preview,.fallback-form,.native-form-wrapper,.state-rules,.style-box,.actions-editor,.label-editor,.auto-zoom-editor,.auto-zoom-card { display:grid; gap:10px; }
+      .editor,.zones,.zone-card,.field,.preview,.fallback-form,.native-form-wrapper,.state-rules,.style-box,.actions-editor,.label-editor,.auto-zoom-editor,.auto-zoom-card,.svg-geometry-editor { display:grid; gap:10px; }
       .editor { gap:18px; }
       .field > span,.style-box-title { color:var(--primary-text-color); font-size:14px; font-weight:500; }
       input,select { box-sizing:border-box; width:100%; min-height:42px; padding:8px 12px; border:1px solid var(--divider-color,#c7c7c7); border-radius:8px; background:var(--card-background-color,#fff); color:var(--primary-text-color,#212121); font:inherit; }
@@ -2902,7 +3477,8 @@ class FloorplanZoneCardEditor extends HTMLElement {
       .native-form,.action-form { display:block; }
       .zone-native-form { margin-top:4px; }
       .grid,.style-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
-      .state-rules,.actions-editor,.label-editor { padding-top:4px; border-top:1px solid var(--divider-color,#ddd); }
+      .state-rules,.actions-editor,.label-editor,.svg-geometry-editor { padding-top:4px; border-top:1px solid var(--divider-color,#ddd); }
+      .svg-zone-add-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:end; padding:10px; border:1px dashed var(--divider-color,#ccc); border-radius:9px; }
       .auto-zoom-editor { padding:14px; border:1px solid var(--divider-color,#d0d0d0); border-radius:10px; }
       .auto-zoom-card { padding:12px; border:1px solid var(--divider-color,#ddd); border-radius:9px; }
       .auto-zoom-card.selected { border-color:var(--primary-color,#03a9f4); box-shadow:inset 0 0 0 1px var(--primary-color,#03a9f4); }
@@ -2921,7 +3497,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
       .rule-warning { padding:0 6px; }
       .empty-rules { font-style:italic; }
       @media (max-width:700px) {
-        .grid,.style-grid,.label-style-grid { grid-template-columns:1fr; }
+        .grid,.style-grid,.label-style-grid,.svg-zone-add-row { grid-template-columns:1fr; }
         .state-rule-row { grid-template-columns:minmax(0,1fr) 54px; }
         .state-rule-row .opacity-control,.state-rule-row select,.state-rule-row .checkbox-control { grid-column:1/-1; }
         .state-rule-delete { grid-column:1/-1; justify-self:end; }
@@ -2957,7 +3533,10 @@ class FloorplanZoneCardEditor extends HTMLElement {
         ? "Editing shape"
         : `Vertex ${this._selectedVertexIndex + 1} selected`;
     } else {
-      status.textContent = "Select a zone";
+      const selected = this._config.zones.find((item) => item.id === this._selectedZoneId);
+      status.textContent = zoneUsesSvgObject(selected)
+        ? `SVG zone · #${selected.svg_element_id}`
+        : "Select a zone";
     }
     previewTitle.append(previewHeading, status);
 
@@ -3042,14 +3621,49 @@ class FloorplanZoneCardEditor extends HTMLElement {
     zoneTitle.className = "section-title";
     const heading = document.createElement("strong");
     heading.textContent = "Zones";
-    const add = this.createButton("Add zone", () => this.startDrawing(), { disabled: this._mode === "draw" || this._mode === "focus-area" || this._mode === "label-position" });
+    const add = this.createButton("Add drawn zone", () => this.startDrawing(), { disabled: this._mode === "draw" || this._mode === "focus-area" || this._mode === "label-position" });
     zoneTitle.append(heading, add);
     zones.append(zoneTitle);
+
+    const unusedSvgElements = this._svgElements.filter((item) => !this.usedSvgElementIds().has(item.id));
+    if (unusedSvgElements.length) {
+      if (!unusedSvgElements.some((item) => item.id === this._selectedSvgElementId)) {
+        this._selectedSvgElementId = unusedSvgElements[0].id;
+      }
+      const svgRow = document.createElement("div");
+      svgRow.className = "svg-zone-add-row";
+      const selector = this.createSelect(
+        this._selectedSvgElementId,
+        unusedSvgElements.map((item) => ({
+          value: item.id,
+          label: `${item.id} · <${item.tag}>${item.title ? ` · ${item.title}` : ""}`,
+        })),
+        (value) => { this._selectedSvgElementId = value; },
+      );
+      svgRow.append(
+        this.createField("Existing SVG object", selector),
+        this.createButton("Add SVG zone", () => this.addSvgObjectZone(this._selectedSvgElementId), {
+          disabled: !this._selectedSvgElementId,
+        }),
+      );
+      zones.append(svgRow);
+      const hint = document.createElement("p");
+      hint.className = "hint";
+      hint.textContent = "SVG objects are detected from elements with an id. Standard paths, rectangles, circles, ellipses, polygons, polylines, groups and internal <use> references are supported.";
+      zones.append(hint);
+    } else if (this._svgSourceError) {
+      const warning = document.createElement("p");
+      warning.className = "validation-warning";
+      warning.textContent = `SVG object detection failed: ${this._svgSourceError}`;
+      zones.append(warning);
+    }
 
     if ((this._config.zones?.length ?? 0) === 0) {
       const hint = document.createElement("p");
       hint.className = "hint";
-      hint.textContent = "Press Add zone, then click at least three points on the floorplan and close the polygon.";
+      hint.textContent = this._svgElements.length
+        ? "Draw a polygon zone or select one of the detected SVG objects above."
+        : "Press Add drawn zone, then click at least three points on the floorplan and close the polygon.";
       zones.append(hint);
     }
 
@@ -3063,28 +3677,28 @@ class FloorplanZoneCardEditor extends HTMLElement {
       name.textContent = zone.name || `Zone ${index + 1}`;
       const actions = document.createElement("div");
       actions.className = "toolbar";
-      actions.append(
-        this.createButton("Edit shape", () => this.selectZone(zone.id), { kind: "secondary" }),
-        this.createButton("Delete", () => {
-          if (this._selectedZoneId === zone.id) {
-            this._selectedZoneId = null;
-            if (this._labelZoneId === zone.id) this._labelZoneId = null;
-            this._selectedVertexIndex = null;
-            this._mode = "select";
-          }
-          const zones = this._config.zones.filter((_, i) => i !== index);
-          const autoZoom = (this._config.auto_zoom ?? []).map((rule) =>
-            rule.target === "zone" && rule.zone_id === zone.id
-              ? normalizeAutoZoomRule({ ...rule, zone_id: "" })
-              : rule
-          );
-          this.updateConfig({ zones, auto_zoom: autoZoom }, true);
-        }, { kind: "danger" }),
-      );
+      if (!zoneUsesSvgObject(zone)) {
+        actions.append(this.createButton("Edit shape", () => this.selectZone(zone.id), { kind: "secondary" }));
+      }
+      actions.append(this.createButton("Delete", () => {
+        if (this._selectedZoneId === zone.id) {
+          this._selectedZoneId = null;
+          if (this._labelZoneId === zone.id) this._labelZoneId = null;
+          this._selectedVertexIndex = null;
+          this._mode = "select";
+        }
+        const zones = this._config.zones.filter((_, i) => i !== index);
+        const autoZoom = (this._config.auto_zoom ?? []).map((rule) =>
+          rule.target === "zone" && rule.zone_id === zone.id
+            ? normalizeAutoZoomRule({ ...rule, zone_id: "" })
+            : rule
+        );
+        this.updateConfig({ zones, auto_zoom: autoZoom }, true);
+      }, { kind: "danger" }));
       header.append(name, actions);
+      zoneCard.append(header, this.createZoneMetadataForm(zone, index));
+      if (zoneUsesSvgObject(zone)) zoneCard.append(this.createSvgGeometryEditor(zone, index));
       zoneCard.append(
-        header,
-        this.createZoneMetadataForm(zone, index),
         this.createLabelEditor(zone, index),
         this.createActionsEditor(zone, index),
         this.createStateRulesEditor(zone, index),
@@ -3113,7 +3727,7 @@ if (!window.customCards.some((card) => card.type === CARD_TYPE)) {
   window.customCards.push({
     type: CARD_TYPE,
     name: "Floorplan Zone Card",
-    description: "Display a zoomable floorplan with state-driven polygon zones, configurable labels and Home Assistant actions.",
+    description: "Display a zoomable floorplan with state-driven drawn or SVG-object zones, configurable labels and Home Assistant actions.",
     preview: true,
     documentationURL: "https://github.com/xtimmy86x/ha-floorplan-zone-card",
   });

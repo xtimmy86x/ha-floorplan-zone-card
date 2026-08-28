@@ -1,6 +1,6 @@
 # Floorplan Zone Card
 
-A Home Assistant custom dashboard card for displaying a zoomable floorplan with polygon zones driven by entity state.
+A Home Assistant custom dashboard card for displaying a zoomable floorplan with drawn polygon or existing SVG-object zones driven by entity state.
 
 ![Floorplan Zone Card preview](images/preview.svg)
 
@@ -8,7 +8,7 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 
 1. choose or upload a floorplan image;
 2. add a zone;
-3. draw the zone directly on the floorplan;
+3. draw the zone directly on the floorplan **or**, when the floorplan is SVG, select an existing object by its `id`;
 4. select any Home Assistant entity;
 5. add as many exact state → visual-style rules as needed, including color, opacity, pulse/blink effects and border highlighting;
 6. optionally add a styled label showing the zone name, custom text, or the entity state;
@@ -18,7 +18,7 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 10. save the card in the normal Home Assistant dashboard editor.
 
 > [!IMPORTANT]
-> This repository is in active early development. The editor supports Home Assistant-native image/media, entity and action selectors, graphical polygon editing, unlimited exact-state styling rules with optional visual effects, configurable zone labels, per-zone interactions, and synchronized floorplan zoom/pan.
+> This repository is in active early development. The editor supports Home Assistant-native image/media, entity and action selectors, graphical polygon editing, direct SVG-object zones, unlimited exact-state styling rules with optional visual effects, configurable zone labels, per-zone interactions, and synchronized floorplan zoom/pan.
 
 ## Current development scope
 
@@ -27,6 +27,8 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Home Assistant image/media selector with image upload support.
 - Backward-compatible support for legacy image URL/path configurations.
 - Home Assistant entity selector with no domain restriction.
+- Automatic discovery of usable SVG elements with `id` attributes and direct SVG-object zone creation.
+- SVG-object zones support paths, rectangles, circles, ellipses, polygons, polylines, groups and internal `<use>` references while preserving group transforms.
 - Unlimited exact raw-state style rules per zone, including color, opacity, pulse/blink effects and active-border highlighting.
 - Separate fallback and unavailable/unknown styles.
 - Backward-compatible migration of legacy binary `on` / `off` zone styles.
@@ -40,7 +42,7 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Pan while zoomed by dragging empty floorplan space; dragging an actionable zone cancels its action and pans instead.
 - Zoom state is UI-only and never changes the normalized polygon coordinates stored in the card configuration.
 - State-triggered auto-zoom rules with exact raw-state matching.
-- Auto-focus target can be an existing polygon zone or a custom rectangle drawn directly in the graphical editor.
+- Auto-focus target can be an existing drawn or SVG-object zone, or a custom rectangle drawn directly in the graphical editor.
 - Ordered auto-zoom priority and configurable exit behavior: previous view, reset to 100%, or keep current view.
 - Responsive image + SVG overlay renderer.
 - Resolution of `media-source://` images through Home Assistant before rendering.
@@ -54,6 +56,30 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Automated Node.js core tests covering normalization, legacy compatibility, state precedence and auto-zoom behavior.
 - Responsive editor polish for state-rule controls and compact mobile rule headers.
 - HACS-compatible `dist/ha-floorplan-zone-card.js` output.
+
+## SVG object zones
+
+When the selected floorplan is an SVG, the editor inspects the SVG document and lists supported elements that have an `id`. A detected object can be added directly as a zone, so rooms or machine areas that already exist as SVG geometry do not need to be redrawn as polygons.
+
+Supported source objects include `path`, `rect`, `circle`, `ellipse`, `polygon`, `polyline`, `g`, and internal `use` references. Parent group transforms are preserved. The original SVG is still rendered as the floorplan image; only sanitized geometry attributes are cloned into the interaction overlay, so source scripts, event handlers and arbitrary SVG markup are never injected into the card DOM.
+
+A generated SVG-backed zone stores the source element id and a normalized bounding box:
+
+```yaml
+geometry: svg
+svg_element_id: kitchen
+svg_bounds:
+  x: 0.08
+  y: 0.12
+  width: 0.31
+  height: 0.27
+```
+
+The bounding box lets labels and state-triggered auto-zoom work exactly like they do for drawn polygons. It is refreshed by the visual editor when the SVG is inspected again. State colors, opacity, pulse/blink effects, active borders, tap/hold/double-tap actions and labels all apply to SVG-backed zones.
+
+Each SVG element can be assigned to one zone at a time in the visual editor. If a referenced id disappears from a replaced SVG file, the editor shows a validation warning instead of silently assigning another object.
+
+> SVG object discovery requires the SVG source to be readable by the browser. Home Assistant `/local/` files and media-source uploads are supported; a remote SVG must allow CORS access for its objects to be inspected.
 
 ## State styles and visual effects
 
