@@ -27,6 +27,85 @@ jobs:
       - uses: hacs/action@main
         with:
           category: plugin
-          # Publishing metadata is intentionally deferred while the card is in
-          # early development. Remove these ignores before the first release.
+          # Repository metadata/images will be completed before any future
+          # submission to the HACS default repository list.
           ignore: description topics images
+
+  release_010:
+    needs: [build, hacs]
+    if: "${{ github.event_name == 'push' && github.event.head_commit.message == 'chore: launch 0.1.0 release' }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Prepare 0.1.0
+        run: |
+          python scripts/prepare_release_010.py
+          rm -f DEV*_NOTES.md
+          rm scripts/prepare_release_010.py
+      - name: Validate release source
+        run: npm run check
+      - name: Build release bundle
+        run: npm run build
+      - name: Ensure source and distribution match
+        run: cmp src/ha-floorplan-zone-card.js dist/ha-floorplan-zone-card.js
+      - name: Validate release with HACS
+        uses: hacs/action@main
+        with:
+          category: plugin
+          ignore: description topics images
+      - name: Commit release
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Release 0.1.0"
+          git push origin main
+      - name: Tag release
+        shell: bash
+        run: |
+          git tag -a v0.1.0 -m "Floorplan Zone Card 0.1.0"
+          git push origin v0.1.0
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          cat > /tmp/release-notes.md <<'EOF'
+          # Floorplan Zone Card 0.1.0
+
+          First public release of **Floorplan Zone Card**, a visual Home Assistant dashboard card for interactive floorplans.
+
+          ## Highlights
+
+          - Draw polygon zones directly in Home Assistant or reuse existing SVG objects by `id`.
+          - Drive each zone from any Home Assistant entity with exact state-based colors and opacity.
+          - Pulse/blink effects and active border highlighting for alarms and status visualization.
+          - Configurable labels with zone name, custom text, or live entity state.
+          - Native Home Assistant tap, hold, and double-tap actions.
+          - 1x–5x zoom, mouse-wheel zoom, pinch zoom, and pan.
+          - High-quality zoom rendering for raster floorplans.
+          - State-triggered auto-focus on zones or custom areas.
+          - SVG-object zones preserve source geometry/transforms and align using the original SVG `viewBox` and `preserveAspectRatio`.
+          - Visual polygon editing with draggable vertices and midpoint insertion.
+          - Backward compatibility for legacy binary on/off zone styling.
+
+          ## Installation
+
+          Add this repository to HACS as a **Dashboard** custom repository, or download the attached `ha-floorplan-zone-card.js` manually.
+
+          See the README for configuration and examples.
+          EOF
+          gh release create v0.1.0 \
+            dist/ha-floorplan-zone-card.js \
+            --verify-tag \
+            --title "Floorplan Zone Card 0.1.0" \
+            --notes-file /tmp/release-notes.md \
+            --latest
