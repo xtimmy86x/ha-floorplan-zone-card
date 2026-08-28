@@ -80,10 +80,9 @@ jobs:
       - name: Commit dev.11
         shell: bash
         run: |
-          git checkout c38e4d0d272aa97b57f8a9af41aa298a8a4e0303 -- .github/workflows/validate.yml
           rm scripts/apply_dev11.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/ha-floorplan-zone-card.js dist/ha-floorplan-zone-card.js package.json tests/core.test.mjs README.md DEV11_NOTES.md scripts/apply_dev11.py .github/workflows/validate.yml
+          git add src/ha-floorplan-zone-card.js dist/ha-floorplan-zone-card.js package.json tests/core.test.mjs README.md DEV11_NOTES.md scripts/apply_dev11.py
           git commit -m "feat(svg): add SVG object zones"
           git push
