@@ -283,3 +283,16 @@ test("SVG bounds are clamped to normalized floorplan coordinates", () => {
   assert.ok(Math.abs(bounds.height - 0.2) < 1e-12);
   assert.equal(core.svgBoundsValid({ x: 0.2, y: 0.2, width: 0, height: 0.3 }), false);
 });
+
+
+
+test("SVG object overlay uses the floorplan viewport directly", async () => {
+  const source = await readFile(new URL("../src/ha-floorplan-zone-card.js", import.meta.url), "utf8");
+  assert.match(source, /\.svg-source-layer \{ position:absolute; inset:0; width:100%; height:100%/);
+  assert.match(source, /const sourceSvgLayer = this\.createSvgSourceLayer\(transform\);/);
+  assert.doesNotMatch(source, /createSvgSourceLayer\(svg\)/);
+  assert.doesNotMatch(source, /layer\.setAttribute\("width", String\(SVG_SIZE\)\)/);
+  assert.doesNotMatch(source, /layer\.setAttribute\("height", String\(SVG_SIZE\)\)/);
+  assert.match(source, /layer\.setAttribute\("viewBox", this\._svgSource\.viewBox\)/);
+  assert.match(source, /layer\.setAttribute\("preserveAspectRatio", this\._svgSource\.preserveAspectRatio\)/);
+});

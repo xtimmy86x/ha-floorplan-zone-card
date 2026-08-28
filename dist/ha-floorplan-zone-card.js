@@ -2,7 +2,7 @@ const CARD_TYPE = "floorplan-zone-card";
 const CARD_TAG = "floorplan-zone-card";
 const EDITOR_TAG = "floorplan-zone-card-editor";
 const CANVAS_TAG = "floorplan-zone-canvas";
-const VERSION = "0.1.0-dev.11";
+const VERSION = "0.1.0-dev.12";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const SVG_SIZE = 1000;
 
@@ -1555,18 +1555,18 @@ class FloorplanZoneCanvas extends HTMLElement {
     }
   }
 
-  createSvgSourceLayer(overlay) {
+  createSvgSourceLayer(transform) {
     if (!this._svgSource) return null;
     const layer = document.createElementNS(SVG_NS, "svg");
     layer.classList.add("svg-source-layer");
-    layer.setAttribute("x", "0");
-    layer.setAttribute("y", "0");
-    layer.setAttribute("width", String(SVG_SIZE));
-    layer.setAttribute("height", String(SVG_SIZE));
+    // This SVG is a CSS-sized sibling of the floorplan image, not a nested
+    // 1000x1000 viewport. Using the source viewBox and preserveAspectRatio on
+    // the exact same rendered rectangle makes the browser apply the same
+    // source-to-screen matrix to both the original SVG image and its zones.
     layer.setAttribute("viewBox", this._svgSource.viewBox);
     layer.setAttribute("preserveAspectRatio", this._svgSource.preserveAspectRatio);
     layer.setAttribute("pointer-events", "none");
-    overlay.append(layer);
+    transform.append(layer);
     return layer;
   }
 
@@ -1770,7 +1770,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       .transform-layer.view-animated { transition:transform ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1),width ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1),height ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1); }
       .floorplan-image { display:block; width:100%; height:100%; image-rendering:auto; user-select:none; pointer-events:none; }
       .floorplan-overlay { position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
-      .svg-source-layer { overflow:visible; pointer-events:none; }
+      .svg-source-layer { position:absolute; inset:0; width:100%; height:100%; overflow:visible; pointer-events:none; }
       .zone { vector-effect:non-scaling-stroke; transition:fill 160ms ease,fill-opacity 160ms ease,stroke 120ms ease,stroke-width 120ms ease,filter 80ms ease; }
       .svg-source-zone * { vector-effect:non-scaling-stroke; }
       .zone.effect-pulse { animation:zone-pulse 1.4s ease-in-out infinite; }
@@ -1870,7 +1870,7 @@ class FloorplanZoneCanvas extends HTMLElement {
     svg.setAttribute("preserveAspectRatio", "none");
     svg.setAttribute("aria-label", "Floorplan zones");
 
-    const sourceSvgLayer = this.createSvgSourceLayer(svg);
+    const sourceSvgLayer = this.createSvgSourceLayer(transform);
 
     for (const zone of this._config?.zones ?? []) {
       const svgObjectZone = zoneUsesSvgObject(zone);
@@ -1904,7 +1904,12 @@ class FloorplanZoneCanvas extends HTMLElement {
         polygon.setAttribute("aria-label", accessibleName);
         polygon.addEventListener("pointerdown", (event) => {
           event.stopPropagation();
-          this.beginZoneGesture(event, zone, svg, polygon);
+          this.beginZoneGesture(
+            event,
+            zone,
+            svgObjectZone && sourceSvgLayer ? sourceSvgLayer : svg,
+            polygon,
+          );
         });
         polygon.addEventListener("keydown", (event) => {
           if (event.key !== "Enter" && event.key !== " ") return;
@@ -2125,6 +2130,21 @@ class FloorplanZoneCanvas extends HTMLElement {
       this.finishBackgroundPan(event, true);
     });
 
+    // SVG-object zones live in a separate native-viewBox overlay. Capture and
+    // finish their action/pan gestures on that overlay while empty areas pass
+    // through to the normalized editor overlay beneath it.
+    if (sourceSvgLayer) {
+      sourceSvgLayer.addEventListener("pointermove", (event) => {
+        if (!interactive) this.moveZoneGesture(event);
+      });
+      sourceSvgLayer.addEventListener("pointerup", (event) => {
+        if (!interactive) this.finishZoneGesture(event, false);
+      });
+      sourceSvgLayer.addEventListener("pointercancel", (event) => {
+        if (!interactive) this.finishZoneGesture(event, true);
+      });
+    }
+
     if (interactive && mode === "edit") {
       svg.addEventListener("pointermove", (event) => {
         if (!this._drag || this._drag.pointerId !== event.pointerId || this._pinch) return;
@@ -2155,8 +2175,19 @@ class FloorplanZoneCanvas extends HTMLElement {
       svg.addEventListener("pointercancel", (event) => finishDrag(event, false));
     }
 
-    if (labelsLayer?.parentElement === transform) transform.insertBefore(svg, labelsLayer);
-    else transform.append(svg);
+    if (labelsLayer?.parentElement === transform) {
+      transform.insertBefore(svg, labelsLayer);
+      // Keep native SVG-object zones above the normalized polygon overlay so
+      // their painted geometry can receive pointer events. The source SVG root
+      // itself remains pointer-events:none, so empty space still reaches the
+      // normalized overlay for drawing and background panning.
+      if (sourceSvgLayer?.parentElement === transform) {
+        transform.insertBefore(sourceSvgLayer, labelsLayer);
+      }
+    } else {
+      transform.append(svg);
+      if (sourceSvgLayer?.parentElement === transform) transform.append(sourceSvgLayer);
+    }
     container.append(transform);
     if (imageConfigured || this._resolvedImage) this.createZoomControls(container);
     this.shadowRoot.append(style, container);
