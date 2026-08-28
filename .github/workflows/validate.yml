@@ -30,3 +30,34 @@ jobs:
           # Publishing metadata is intentionally deferred while the card is in
           # early development. Remove these ignores before the first release.
           ignore: description topics images
+
+  dev12_patch:
+    needs: [build, hacs]
+    if: github.event_name == 'push' && github.event.head_commit.message == 'chore: prepare dev.12 SVG alignment fix'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Apply dev.12 SVG alignment changes
+        run: python scripts/apply_dev12.py
+      - name: Validate
+        run: npm run check
+      - name: Build distribution bundle
+        run: npm run build
+      - name: Ensure source and distribution match
+        run: cmp src/ha-floorplan-zone-card.js dist/ha-floorplan-zone-card.js
+      - name: Commit dev.12
+        shell: bash
+        run: |
+          git rm scripts/apply_dev12.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/ha-floorplan-zone-card.js dist/ha-floorplan-zone-card.js package.json tests/core.test.mjs DEV12_NOTES.md scripts/apply_dev12.py
+          git commit -m "fix(svg): align SVG object zones with floorplan"
+          git push
