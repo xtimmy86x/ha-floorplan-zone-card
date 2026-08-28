@@ -30,39 +30,3 @@ jobs:
           # Repository metadata/images will be completed before any future
           # submission to the HACS default repository list.
           ignore: description topics images
-
-  release_011:
-    needs: [build, hacs]
-    if: "${{ github.event_name == 'push' && github.event.head_commit.message == 'chore: publish v0.1.1' }}"
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-      - name: Publish v0.1.1
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          cat > /tmp/release-notes.md <<'EOF'
-          ## Floorplan Zone Card 0.1.1
-
-          This release focuses on the Home Assistant visual editor UI/UX.
-
-          ### Changed
-          - Redesigned the editor for narrow Home Assistant configuration dialogs.
-          - Added container-query responsive layouts based on the actual editor-column width.
-          - Removed horizontal overflow from auto-zoom, state styles, labels and SVG-object controls.
-          - Added a collapsible Floorplan workspace that opens automatically when interactive editing is required.
-          - Added collapsible zone cards with compact entity and geometry summaries.
-          - Unified drawn-zone and SVG-object creation in a single Add zone panel.
-          - Improved narrow-layout state rule controls while retaining a wider desktop layout where space allows.
-
-          No YAML/configuration migration is required.
-          EOF
-          gh release create v0.1.1 \
-            dist/ha-floorplan-zone-card.js#ha-floorplan-zone-card.js \
-            --repo "$GITHUB_REPOSITORY" \
-            --target b0905acea2ce0864798e2ee2b10f1b03c2ec2dc0 \
-            --title "Floorplan Zone Card 0.1.1" \
-            --notes-file /tmp/release-notes.md
