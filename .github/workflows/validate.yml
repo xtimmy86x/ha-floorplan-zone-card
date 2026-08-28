@@ -33,7 +33,7 @@ jobs:
 
   dev12_patch:
     needs: [build, hacs]
-    if: github.event_name == 'push' && github.event.head_commit.message == 'chore: prepare dev.12 SVG alignment fix'
+    if: "${{ github.event_name == 'push' && github.event.head_commit.message == 'chore: trigger dev.12 SVG alignment fix' }}"
     runs-on: ubuntu-latest
     permissions:
       contents: write
