@@ -296,3 +296,19 @@ test("SVG object overlay uses the floorplan viewport directly", async () => {
   assert.match(source, /layer\.setAttribute\("viewBox", this\._svgSource\.viewBox\)/);
   assert.match(source, /layer\.setAttribute\("preserveAspectRatio", this\._svgSource\.preserveAspectRatio\)/);
 });
+
+
+
+test("editor UI is container-responsive and collapsible", async () => {
+  const source = await readFile(new URL("../src/ha-floorplan-zone-card.js", import.meta.url), "utf8");
+  assert.match(source, /const VERSION = "0\.1\.1"/);
+  assert.match(source, /container-type:inline-size/);
+  assert.match(source, /@container \(min-width:600px\)/);
+  assert.match(source, /this\._workspaceOpen = false/);
+  assert.match(source, /workspace-body/);
+  assert.match(source, /this\._expandedZoneIds = new Set\(\)/);
+  assert.match(source, /zone-card-body/);
+  assert.match(source, /Add zone/);
+  assert.match(source, /Draw manually/);
+  assert.doesNotMatch(source, /@media \(max-width:700px\)/);
+});

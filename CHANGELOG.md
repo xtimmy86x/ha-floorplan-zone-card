@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.1 - 2026-08-28
+
+### Changed
+
+- Redesigned the Home Assistant visual editor for narrow configuration dialogs.
+- Added container-query based responsive layouts so forms react to the editor column width instead of the browser viewport.
+- Removed horizontal form overflow in auto-zoom, state styling, labels, and SVG-object controls.
+- Added a collapsible Floorplan workspace that opens automatically for drawing, shape editing, label placement, and custom auto-zoom area selection.
+- Added collapsible zone cards with compact entity/geometry summaries.
+- Grouped drawn and SVG-object creation into one Add zone panel.
+- Made state-rule controls stack cleanly in narrow editors while retaining the wider desktop layout when space is available.
+
 ## 0.1.0 - 2026-08-28
 
 First public release of Floorplan Zone Card.
