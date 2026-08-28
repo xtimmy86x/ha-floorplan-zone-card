@@ -221,3 +221,5 @@ Validation:
           git add src/ha-floorplan-zone-card.js dist/ha-floorplan-zone-card.js package.json tests/core.test.mjs DEV10_NOTES.md .github/workflows/dev10-render-patch.yml
           git commit -m "fix(zoom): preserve floorplan image quality"
           git push
+
+# trigger: workflow already present on default branch
