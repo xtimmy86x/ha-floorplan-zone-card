@@ -2,7 +2,7 @@ name: Validate
 
 on:
   push:
-    branches: [main, ui-0.1.1]
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -33,13 +33,14 @@ jobs:
 
   ui_011_patch:
     needs: [build, hacs]
-    if: "${{ github.event_name == 'push' && github.event.head_commit.message == 'chore: apply 0.1.1 UI refactor' }}"
+    if: "${{ github.event_name == 'pull_request' && github.head_ref == 'ui-0.1.1' }}"
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ui-0.1.1
           fetch-depth: 3
       - uses: actions/setup-node@v6
         with:
