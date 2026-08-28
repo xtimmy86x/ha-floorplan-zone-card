@@ -36,6 +36,10 @@ async function loadCore() {
 
   const expose = `\n;globalThis.__core = {
     normalizeStateRule,
+    normalizeLabel,
+    polygonCentroid,
+    zoneLabelPoint,
+    zoneLabelLines,
     stateRuleValidation,
     normalizedConfig,
     stateStyle,
@@ -160,4 +164,69 @@ test("focus view stays bounded and respects zoom limits", () => {
 test("legacy zones keep implicit more-info tap action", () => {
   const action = structuredClone(core.effectiveAction({ entity: "sensor.example" }, "tap_action"));
   assert.deepEqual(action, { action: "more-info" });
+});
+
+
+test("normalizes labels with safe defaults and bounded styling", () => {
+  const label = structuredClone(core.normalizeLabel({
+    enabled: true,
+    content: "name_state",
+    position_mode: "custom",
+    position: { x: 1.4, y: -0.2 },
+    color: "#123456",
+    size: 120,
+    weight: 700,
+    opacity: 1.4,
+    background: true,
+    background_color: "#111111",
+    background_opacity: -1,
+  }));
+  assert.equal(label.enabled, true);
+  assert.equal(label.content, "name_state");
+  assert.deepEqual(label.position, { x: 1, y: 0 });
+  assert.equal(label.size, 72);
+  assert.equal(label.weight, 700);
+  assert.equal(label.opacity, 1);
+  assert.equal(label.background, true);
+  assert.equal(label.background_opacity, 0);
+
+  const fallback = structuredClone(core.normalizeLabel({ content: "bad", weight: 999 }));
+  assert.equal(fallback.enabled, false);
+  assert.equal(fallback.content, "name");
+  assert.equal(fallback.position_mode, "auto");
+  assert.equal(fallback.weight, 600);
+});
+
+test("automatic labels use polygon centroid while custom labels keep their point", () => {
+  const points = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 0, y: 1 }];
+  const centroid = structuredClone(core.polygonCentroid(points));
+  assert.ok(Math.abs(centroid.x - 1 / 3) < 1e-9);
+  assert.ok(Math.abs(centroid.y - 1 / 3) < 1e-9);
+
+  const automatic = structuredClone(core.zoneLabelPoint({ points, label: { enabled: true } }));
+  assert.ok(Math.abs(automatic.x - 1 / 3) < 1e-9);
+  assert.ok(Math.abs(automatic.y - 1 / 3) < 1e-9);
+
+  const custom = structuredClone(core.zoneLabelPoint({
+    points,
+    label: { enabled: true, position_mode: "custom", position: { x: 0.8, y: 0.2 } },
+  }));
+  assert.deepEqual(custom, { x: 0.8, y: 0.2 });
+});
+
+test("name plus state labels include Home Assistant units", () => {
+  const lines = structuredClone(core.zoneLabelLines({
+    states: {
+      "sensor.temperature": {
+        state: "23.4",
+        attributes: { unit_of_measurement: "°C" },
+      },
+    },
+  }, {
+    id: "zone_1",
+    name: "Boiler room",
+    entity: "sensor.temperature",
+    label: { enabled: true, content: "name_state" },
+  }));
+  assert.deepEqual(lines, ["Boiler room", "23.4 °C"]);
 });

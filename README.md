@@ -11,13 +11,14 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 3. draw the zone directly on the floorplan;
 4. select any Home Assistant entity;
 5. add as many exact state → visual-style rules as needed, including color, opacity, pulse/blink effects and border highlighting;
-6. optionally configure Home Assistant actions for the zone;
-7. zoom and pan the floorplan while keeping every zone aligned;
-8. optionally add state-triggered auto-zoom rules that focus a zone or a custom area;
-9. save the card in the normal Home Assistant dashboard editor.
+6. optionally add a styled label showing the zone name, custom text, or the entity state;
+7. optionally configure Home Assistant actions for the zone;
+8. zoom and pan the floorplan while keeping every zone and label aligned;
+9. optionally add state-triggered auto-zoom rules that focus a zone or a custom area;
+10. save the card in the normal Home Assistant dashboard editor.
 
 > [!IMPORTANT]
-> This repository is in active early development. The editor supports Home Assistant-native image/media, entity and action selectors, graphical polygon editing, unlimited exact-state styling rules with optional visual effects, per-zone interactions, and synchronized floorplan zoom/pan.
+> This repository is in active early development. The editor supports Home Assistant-native image/media, entity and action selectors, graphical polygon editing, unlimited exact-state styling rules with optional visual effects, configurable zone labels, per-zone interactions, and synchronized floorplan zoom/pan.
 
 ## Current development scope
 
@@ -29,6 +30,10 @@ The goal is a configuration flow that does **not** require editing SVG files, wr
 - Unlimited exact raw-state style rules per zone, including color, opacity, pulse/blink effects and active-border highlighting.
 - Separate fallback and unavailable/unknown styles.
 - Backward-compatible migration of legacy binary `on` / `off` zone styles.
+- Optional per-zone labels with zone name, custom text, or live zone name + entity state content.
+- Automatic label centering or normalized custom label positioning directly on the graphical floorplan.
+- Configurable label text color, font size, font weight, opacity and optional background color/opacity.
+- Labels stay readable during zoom and remain independent from polygon pulse/blink effects.
 - Per-zone `tap_action`, `hold_action`, and `double_tap_action` using Home Assistant's standard action model.
 - Standard `hass-action` dispatch for `more-info`, `toggle`, `perform-action`, `navigate`, `url`, `assist`, confirmation and other supported actions.
 - Synchronized image + SVG zoom from `1x` to `5x`, with controls, mouse wheel and pinch gestures.
@@ -110,6 +115,39 @@ The editor warns without blocking saves when:
 - a rule uses `unknown` or `unavailable`, which are handled by the dedicated **Unavailable / unknown** style and therefore cannot reach a normal state rule.
 
 Newly drawn zones start with `off` and `on` rules as a convenience for binary entities, but they can be edited, removed, or replaced with any values.
+
+## Zone labels
+
+Each zone can optionally display a label above the polygon. Labels use a separate overlay from the animated SVG fill, so a blinking or pulsing zone never makes its text blink.
+
+The visual editor offers three content modes:
+
+- **Zone name** — displays the zone `name`;
+- **Custom text** — displays arbitrary text entered in the editor;
+- **Zone name + entity state** — displays the zone name on the first line and the live Home Assistant state on the second line. If the entity exposes `unit_of_measurement`, the unit is included automatically.
+
+Example:
+
+```yaml
+label:
+  enabled: true
+  content: name_state
+  position_mode: custom
+  position:
+    x: 0.52
+    y: 0.31
+  color: "#ffffff"
+  size: 18
+  weight: 600
+  opacity: 1
+  background: true
+  background_color: "#000000"
+  background_opacity: 0.55
+```
+
+Position can be **Automatic center** or **Custom position**. Automatic mode derives the label anchor from the polygon geometry and therefore follows later shape edits automatically. In custom mode, press **Place label** and either click the desired point on the floorplan or drag the label itself. The saved position uses normalized `0..1` coordinates, just like polygon points.
+
+Label font size is kept visually stable while zooming: the anchor follows the transformed image, but the text is counter-scaled so it stays readable at `1x` through `5x`. Labels never intercept normal dashboard zone actions.
 
 ## Zone actions
 
@@ -245,6 +283,17 @@ zones:
         y: 0.8
       - x: 0.2
         y: 0.8
+    label:
+      enabled: true
+      content: name_state
+      position_mode: auto
+      color: "#ffffff"
+      size: 18
+      weight: 600
+      opacity: 1
+      background: true
+      background_color: "#000000"
+      background_opacity: 0.55
     states:
       - value: "idle"
         color: "#808080"
@@ -339,6 +388,9 @@ dist/ha-floorplan-zone-card.js
 - [x] Per-state pulse/blink effects
 - [x] Per-state active-border highlighting
 - [x] Fallback and unavailable styles
+- [x] Configurable zone labels
+- [x] Automatic/manual graphical label positioning
+- [x] Live name + entity-state labels with units
 - [x] Native Home Assistant zone action selectors
 - [x] Runtime tap / hold / double tap actions
 - [x] Synchronized image + zone zoom controls

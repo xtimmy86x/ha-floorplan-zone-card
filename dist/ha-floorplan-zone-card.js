@@ -2,7 +2,7 @@ const CARD_TYPE = "floorplan-zone-card";
 const CARD_TAG = "floorplan-zone-card";
 const EDITOR_TAG = "floorplan-zone-card-editor";
 const CANVAS_TAG = "floorplan-zone-canvas";
-const VERSION = "0.1.0-dev.8";
+const VERSION = "0.1.0-dev.9";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const SVG_SIZE = 1000;
 
@@ -27,6 +27,22 @@ const AUTO_ZOOM_EXIT_BEHAVIORS = new Set(["previous", "reset", "keep"]);
 const STATE_EFFECTS = new Set(["none", "pulse", "blink"]);
 const UNAVAILABLE_ENTITY_STATES = new Set(["unknown", "unavailable"]);
 const HIGHLIGHT_BORDER_WIDTH = 4;
+const LABEL_CONTENT_MODES = new Set(["name", "custom", "name_state"]);
+const LABEL_POSITION_MODES = new Set(["auto", "custom"]);
+const LABEL_FONT_WEIGHTS = new Set([400, 500, 600, 700]);
+const DEFAULT_LABEL = Object.freeze({
+  enabled: false,
+  content: "name",
+  text: "",
+  position_mode: "auto",
+  color: "#ffffff",
+  size: 18,
+  weight: 600,
+  opacity: 1,
+  background: false,
+  background_color: "#000000",
+  background_opacity: 0.55,
+});
 
 function deepClone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -49,6 +65,88 @@ function normalizeStyle(style, fallback) {
     color: typeof style?.color === "string" && style.color ? style.color : fallback.color,
     opacity: clamp01(style?.opacity ?? fallback.opacity),
   };
+}
+
+function normalizeLabel(label) {
+  const weight = Number(label?.weight);
+  return {
+    enabled: label?.enabled === true,
+    content: LABEL_CONTENT_MODES.has(label?.content) ? label.content : DEFAULT_LABEL.content,
+    text: label?.text === undefined || label?.text === null ? "" : String(label.text),
+    position_mode: LABEL_POSITION_MODES.has(label?.position_mode)
+      ? label.position_mode
+      : DEFAULT_LABEL.position_mode,
+    position: label?.position && typeof label.position === "object"
+      ? normalizePoint(label.position)
+      : undefined,
+    color: typeof label?.color === "string" && label.color
+      ? label.color
+      : DEFAULT_LABEL.color,
+    size: clamp(label?.size ?? DEFAULT_LABEL.size, 8, 72),
+    weight: LABEL_FONT_WEIGHTS.has(weight) ? weight : DEFAULT_LABEL.weight,
+    opacity: clamp01(label?.opacity ?? DEFAULT_LABEL.opacity),
+    background: label?.background === true,
+    background_color: typeof label?.background_color === "string" && label.background_color
+      ? label.background_color
+      : DEFAULT_LABEL.background_color,
+    background_opacity: clamp01(
+      label?.background_opacity ?? DEFAULT_LABEL.background_opacity,
+    ),
+  };
+}
+
+function polygonCentroid(points) {
+  if (!Array.isArray(points) || points.length < 3) return { x: 0.5, y: 0.5 };
+  let twiceArea = 0;
+  let x = 0;
+  let y = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const current = normalizePoint(points[index]);
+    const next = normalizePoint(points[(index + 1) % points.length]);
+    const cross = current.x * next.y - next.x * current.y;
+    twiceArea += cross;
+    x += (current.x + next.x) * cross;
+    y += (current.y + next.y) * cross;
+  }
+  if (Math.abs(twiceArea) < 1e-8) {
+    const xs = points.map((point) => clamp01(point.x));
+    const ys = points.map((point) => clamp01(point.y));
+    return {
+      x: (Math.min(...xs) + Math.max(...xs)) / 2,
+      y: (Math.min(...ys) + Math.max(...ys)) / 2,
+    };
+  }
+  return normalizePoint({
+    x: x / (3 * twiceArea),
+    y: y / (3 * twiceArea),
+  });
+}
+
+function zoneLabelPoint(zone) {
+  const label = normalizeLabel(zone?.label);
+  if (label.position_mode === "custom" && label.position) {
+    return normalizePoint(label.position);
+  }
+  return polygonCentroid(zone?.points);
+}
+
+function entityDisplayState(hass, entityId) {
+  if (!entityId) return "";
+  const entity = hass?.states?.[entityId];
+  if (!entity) return "";
+  const unit = entity.attributes?.unit_of_measurement;
+  return `${entity.state}${unit ? ` ${unit}` : ""}`;
+}
+
+function zoneLabelLines(hass, zone) {
+  const label = normalizeLabel(zone?.label);
+  const name = zone?.name || zone?.entity || zone?.id || "Zone";
+  if (label.content === "custom") return [label.text || name];
+  if (label.content === "name_state") {
+    const state = entityDisplayState(hass, zone?.entity);
+    return state ? [name, state] : [name];
+  }
+  return [name];
 }
 
 function normalizeStateRule(rule) {
@@ -230,6 +328,7 @@ function normalizeZone(zone) {
     tap_action: normalizeAction(zone?.tap_action),
     hold_action: normalizeAction(zone?.hold_action),
     double_tap_action: normalizeAction(zone?.double_tap_action),
+    label: normalizeLabel(zone?.label),
   };
   delete normalized.on;
   delete normalized.off;
@@ -272,6 +371,7 @@ function createZone(points, zones) {
     tap_action: { ...DEFAULT_TAP_ACTION },
     hold_action: { ...DEFAULT_NONE_ACTION },
     double_tap_action: { ...DEFAULT_NONE_ACTION },
+    label: { ...DEFAULT_LABEL },
   };
 }
 
@@ -367,10 +467,12 @@ class FloorplanZoneCanvas extends HTMLElement {
       selectedVertexIndex: null,
       draftPoints: [],
       focusArea: null,
+      labelZoneId: null,
     };
     this._view = normalizeViewState();
     this._drag = null;
     this._focusAreaDrag = null;
+    this._labelDrag = null;
     this._backgroundPan = null;
     this._actionGesture = null;
     this._pendingTap = null;
@@ -401,6 +503,7 @@ class FloorplanZoneCanvas extends HTMLElement {
     const key = imageContentId(this._config?.image);
     if (key && key === this._imageKey && this._resolvedImage) {
       this.updateZoneVisualStates();
+      this.updateZoneLabels();
       return;
     }
     this.refreshImage();
@@ -422,6 +525,7 @@ class FloorplanZoneCanvas extends HTMLElement {
         ? state.draftPoints.map(normalizePoint)
         : [],
       focusArea: state?.focusArea ? normalizeFocusArea(state.focusArea) : null,
+      labelZoneId: state?.labelZoneId ?? null,
     };
     this.render();
   }
@@ -446,6 +550,7 @@ class FloorplanZoneCanvas extends HTMLElement {
     this.clearPendingTap();
     this._backgroundPan = null;
     this._focusAreaDrag = null;
+    this._labelDrag = null;
     this._touchPointers.clear();
     this._pinch = null;
     if (this._clickSuppressTimer) clearTimeout(this._clickSuppressTimer);
@@ -521,6 +626,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       const baseRadius = Number(node.dataset.screenRadius);
       if (Number.isFinite(baseRadius)) node.setAttribute("r", String(baseRadius / scale));
     });
+    transform.style.setProperty("--label-counter-scale", String(1 / scale));
     viewport.classList.toggle("zoomed", scale > MIN_ZOOM + 0.001);
     if (indicator) indicator.textContent = `${Math.round(scale * 100)}%`;
     if (zoomIn) zoomIn.disabled = scale >= MAX_ZOOM - 0.001;
@@ -678,6 +784,18 @@ class FloorplanZoneCanvas extends HTMLElement {
       this._focusAreaDrag = null;
     }
     this.cancelVertexDragGeometry();
+    if (this._labelDrag) {
+      const drag = this._labelDrag;
+      try {
+        drag.anchor.releasePointerCapture(drag.pointerId);
+      } catch (_error) {
+        // Pointer capture is optional.
+      }
+      drag.anchor.style.left = `${drag.startPoint.x * 100}%`;
+      drag.anchor.style.top = `${drag.startPoint.y * 100}%`;
+      drag.anchor.classList.remove("dragging");
+      this._labelDrag = null;
+    }
     this.clearPendingTap();
     this._pinch = {
       startDistance: distance,
@@ -1116,6 +1234,84 @@ class FloorplanZoneCanvas extends HTMLElement {
     });
   }
 
+  applyZoneLabelContent(element, zone) {
+    if (!element || !zone) return;
+    const lines = zoneLabelLines(this._hass, zone);
+    const primary = element.querySelector(".zone-label-primary");
+    const secondary = element.querySelector(".zone-label-secondary");
+    if (primary) primary.textContent = lines[0] ?? "";
+    if (secondary) {
+      secondary.textContent = lines[1] ?? "";
+      secondary.hidden = !lines[1];
+    }
+  }
+
+  updateZoneLabels() {
+    const labels = this.shadowRoot?.querySelectorAll(".zone-label-anchor[data-zone-id]");
+    if (!labels?.length) return;
+    const zonesById = new Map(
+      (this._config?.zones ?? []).filter((zone) => zone.id).map((zone) => [zone.id, zone]),
+    );
+    labels.forEach((label) => {
+      const zone = zonesById.get(label.dataset.zoneId ?? "");
+      if (zone) this.applyZoneLabelContent(label, zone);
+    });
+  }
+
+  beginLabelDrag(event, zone, anchor) {
+    if (this._pinch || !zone?.id) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this._labelDrag = {
+      zoneId: zone.id,
+      pointerId: event.pointerId,
+      anchor,
+      startPoint: zoneLabelPoint(zone),
+    };
+    anchor.classList.add("dragging");
+    try {
+      anchor.setPointerCapture(event.pointerId);
+    } catch (_error) {
+      // Pointer capture is optional.
+    }
+  }
+
+  moveLabelDrag(event) {
+    const drag = this._labelDrag;
+    if (!drag || drag.pointerId !== event.pointerId || this._pinch) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const point = this.normalizedPointUnderClient(event.clientX, event.clientY);
+    drag.anchor.style.left = `${point.x * 100}%`;
+    drag.anchor.style.top = `${point.y * 100}%`;
+  }
+
+  finishLabelDrag(event, commit = true) {
+    const drag = this._labelDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      drag.anchor.releasePointerCapture(event.pointerId);
+    } catch (_error) {
+      // Pointer capture is optional.
+    }
+    const point = commit && !this._pinch
+      ? this.normalizedPointUnderClient(event.clientX, event.clientY)
+      : drag.startPoint;
+    drag.anchor.style.left = `${point.x * 100}%`;
+    drag.anchor.style.top = `${point.y * 100}%`;
+    drag.anchor.classList.remove("dragging");
+    this._labelDrag = null;
+    if (commit && !this._pinch) {
+      this.dispatchEditorEvent("floorplan-label-position-commit", {
+        zoneId: drag.zoneId,
+        point: normalizePoint(point),
+      });
+    }
+  }
+
   render() {
     if (!this.shadowRoot) return;
     this._drag = null;
@@ -1130,6 +1326,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       selectedVertexIndex,
       draftPoints,
       focusArea,
+      labelZoneId,
     } = this._editorState;
     const imageConfigured = Boolean(imageContentId(this._config?.image));
 
@@ -1183,6 +1380,15 @@ class FloorplanZoneCanvas extends HTMLElement {
       .canvas.zoomed svg { cursor:grab; }
       .canvas.zoomed svg:active { cursor:grabbing; }
       .canvas.zoomed polygon.actionable { cursor:pointer; }
+      .zone-label-layer { position:absolute; inset:0; pointer-events:none; }
+      .zone-label-anchor { position:absolute; width:0; height:0; pointer-events:none; }
+      .zone-label-box { position:absolute; left:0; top:0; transform:translate(-50%,-50%) scale(var(--label-counter-scale,1)); transform-origin:center; display:grid; justify-items:center; gap:1px; min-width:max-content; padding:3px 7px; border-radius:6px; box-sizing:border-box; font-family:var(--ha-card-header-font-family,var(--primary-font-family,sans-serif)); line-height:1.15; text-align:center; white-space:nowrap; user-select:none; transition:box-shadow 120ms ease,outline-color 120ms ease; }
+      .transform-layer.view-animated .zone-label-box { transition:transform ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1),box-shadow 120ms ease,outline-color 120ms ease; }
+      .zone-label-anchor.editable { pointer-events:auto; z-index:3; }
+      .zone-label-anchor.editable .zone-label-box { cursor:grab; outline:2px dashed color-mix(in srgb,var(--primary-color,#03a9f4) 70%,transparent); outline-offset:3px; }
+      .zone-label-anchor.dragging .zone-label-box { cursor:grabbing; box-shadow:0 2px 10px rgba(0,0,0,.28); }
+      .zone-label-primary { font-size:1em; font-weight:inherit; }
+      .zone-label-secondary { font-size:.78em; font-weight:500; }
     `;
 
     const container = document.createElement("div");
@@ -1228,7 +1434,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       polygon.setAttribute("points", pointList(zone.points));
       this.applyZoneVisualState(polygon, zone);
 
-      if (interactive && mode !== "draw" && mode !== "focus-area") {
+      if (interactive && mode !== "draw" && mode !== "focus-area" && mode !== "label-position") {
         polygon.classList.add("selectable");
         polygon.addEventListener("click", (event) => {
           event.stopPropagation();
@@ -1319,6 +1525,62 @@ class FloorplanZoneCanvas extends HTMLElement {
           svg.append(handle);
         });
       }
+    }
+
+    const labelsLayer = document.createElement("div");
+    labelsLayer.className = "zone-label-layer";
+    for (const zone of this._config?.zones ?? []) {
+      const label = normalizeLabel(zone.label);
+      if (!label.enabled || !Array.isArray(zone.points) || zone.points.length < 3) continue;
+      const point = zoneLabelPoint(zone);
+      const anchor = document.createElement("div");
+      anchor.className = "zone-label-anchor";
+      anchor.dataset.zoneId = zone.id ?? "";
+      anchor.style.left = `${point.x * 100}%`;
+      anchor.style.top = `${point.y * 100}%`;
+
+      const box = document.createElement("div");
+      box.className = "zone-label-box";
+      box.style.color = label.color;
+      box.style.fontSize = `${label.size}px`;
+      box.style.fontWeight = String(label.weight);
+      box.style.background = label.background
+        ? `color-mix(in srgb, ${label.background_color} ${Math.round(label.background_opacity * 100)}%, transparent)`
+        : "transparent";
+
+      const primary = document.createElement("span");
+      primary.className = "zone-label-primary";
+      primary.style.opacity = String(label.opacity);
+      const secondary = document.createElement("span");
+      secondary.className = "zone-label-secondary";
+      secondary.style.opacity = String(label.opacity * 0.86);
+      box.append(primary, secondary);
+      anchor.append(box);
+      this.applyZoneLabelContent(anchor, zone);
+
+      if (interactive && mode === "label-position" && zone.id === labelZoneId) {
+        anchor.classList.add("editable");
+        anchor.addEventListener("pointerdown", (event) => this.beginLabelDrag(event, zone, anchor));
+        anchor.addEventListener("pointermove", (event) => this.moveLabelDrag(event));
+        anchor.addEventListener("pointerup", (event) => this.finishLabelDrag(event, true));
+        anchor.addEventListener("pointercancel", (event) => this.finishLabelDrag(event, false));
+      }
+      labelsLayer.append(anchor);
+    }
+    transform.append(labelsLayer);
+
+    if (interactive && mode === "label-position") {
+      svg.addEventListener("click", (event) => {
+        if (this.consumeSuppressedClick()) return;
+        this.dispatchEditorEvent("floorplan-label-position-commit", {
+          zoneId: labelZoneId,
+          point: this.pointerPoint(event, svg),
+        });
+      });
+      const hint = document.createElement("div");
+      hint.className = "draw-hint";
+      hint.textContent = "Click to place the label or drag the label itself · wheel/pinch zoom remains available";
+      container.append(hint);
     }
 
     if (interactive && mode === "focus-area") {
@@ -1436,7 +1698,8 @@ class FloorplanZoneCanvas extends HTMLElement {
       svg.addEventListener("pointercancel", (event) => finishDrag(event, false));
     }
 
-    transform.append(svg);
+    if (labelsLayer?.parentElement === transform) transform.insertBefore(svg, labelsLayer);
+    else transform.append(svg);
     container.append(transform);
     if (imageConfigured || this._resolvedImage) this.createZoomControls(container);
     this.shadowRoot.append(style, container);
@@ -1606,6 +1869,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
     this._selectedVertexIndex = null;
     this._draftPoints = [];
     this._focusRuleIndex = null;
+    this._labelZoneId = null;
     this._viewState = normalizeViewState();
     this._haFormReadyListener = null;
   }
@@ -1616,12 +1880,16 @@ class FloorplanZoneCardEditor extends HTMLElement {
     if (!selectedZone) {
       this._selectedZoneId = null;
       this._selectedVertexIndex = null;
-      if (this._mode === "edit") this._mode = "select";
+      if (this._mode === "edit" || this._mode === "label-position") this._mode = "select";
     } else if (
       this._selectedVertexIndex !== null &&
       this._selectedVertexIndex >= selectedZone.points.length
     ) {
       this._selectedVertexIndex = null;
+    }
+    if (this._labelZoneId && !this._config.zones.some((zone) => zone.id === this._labelZoneId)) {
+      this._labelZoneId = null;
+      if (this._mode === "label-position") this._mode = "select";
     }
     if (
       this._focusRuleIndex !== null &&
@@ -1675,6 +1943,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
       focusArea: this._focusRuleIndex === null
         ? null
         : this._config?.auto_zoom?.[this._focusRuleIndex]?.area ?? null,
+      labelZoneId: this._labelZoneId,
     };
   }
 
@@ -1750,6 +2019,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
   startFocusAreaSelection(index) {
     if (!this._config?.auto_zoom?.[index]) return;
     this._focusRuleIndex = index;
+    this._labelZoneId = null;
     this._mode = "focus-area";
     this._selectedZoneId = null;
     this._selectedVertexIndex = null;
@@ -1780,14 +2050,62 @@ class FloorplanZoneCardEditor extends HTMLElement {
     this._selectedZoneId = zoneId;
     this._selectedVertexIndex = null;
     this._focusRuleIndex = null;
+    this._labelZoneId = null;
     this._mode = "edit";
     this._draftPoints = [];
     this.render();
   }
 
+  startLabelPositioning(zoneId) {
+    const zone = this._config?.zones?.find((item) => item.id === zoneId);
+    if (!zone) return;
+    this._labelZoneId = zoneId;
+    this._selectedZoneId = zoneId;
+    this._selectedVertexIndex = null;
+    this._focusRuleIndex = null;
+    this._draftPoints = [];
+    this._mode = "label-position";
+    const index = this._config.zones.findIndex((item) => item.id === zoneId);
+    if (index >= 0 && normalizeLabel(zone.label).position_mode !== "custom") {
+      this.updateZone(index, (current) => ({
+        ...current,
+        label: {
+          ...normalizeLabel(current.label),
+          position_mode: "custom",
+          position: zoneLabelPoint(current),
+        },
+      }), true);
+    } else {
+      this.render();
+    }
+  }
+
+  finishLabelPositioning() {
+    this._labelZoneId = null;
+    this._mode = "select";
+    this.render();
+  }
+
+  commitLabelPosition(zoneId, point) {
+    const index = this._config?.zones?.findIndex((zone) => zone.id === zoneId);
+    if (index < 0 || !point) return;
+    this._labelZoneId = zoneId;
+    this._selectedZoneId = zoneId;
+    this.updateZone(index, (current) => ({
+      ...current,
+      label: {
+        ...normalizeLabel(current.label),
+        enabled: true,
+        position_mode: "custom",
+        position: normalizePoint(point),
+      },
+    }));
+  }
+
   startDrawing() {
     this._mode = "draw";
     this._focusRuleIndex = null;
+    this._labelZoneId = null;
     this._selectedZoneId = null;
     this._selectedVertexIndex = null;
     this._draftPoints = [];
@@ -1870,6 +2188,20 @@ class FloorplanZoneCardEditor extends HTMLElement {
     input.value = value ?? "";
     input.placeholder = placeholder ?? "";
     input.addEventListener("input", () => onInput(input.value));
+    return input;
+  }
+
+  createNumberInput(value, min, max, step, onInput) {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.min = String(min);
+    input.max = String(max);
+    input.step = String(step);
+    input.value = String(value ?? "");
+    input.addEventListener("input", () => {
+      const number = Number(input.value);
+      if (Number.isFinite(number)) onInput(number);
+    });
     return input;
   }
 
@@ -2221,6 +2553,161 @@ class FloorplanZoneCardEditor extends HTMLElement {
     return section;
   }
 
+  createLabelEditor(zone, zoneIndex) {
+    const label = normalizeLabel(zone.label);
+    const section = document.createElement("div");
+    section.className = "label-editor";
+
+    const heading = document.createElement("strong");
+    heading.textContent = "Zone label";
+    section.append(heading);
+    section.append(this.createCheckbox("Show label", label.enabled, (enabled) => {
+      this.updateZone(zoneIndex, (current) => ({
+        ...current,
+        label: { ...normalizeLabel(current.label), enabled },
+      }), true);
+    }));
+
+    if (!label.enabled) {
+      const hint = document.createElement("p");
+      hint.className = "hint";
+      hint.textContent = "Enable the label to show the zone name, custom text, or the zone name with the entity state.";
+      section.append(hint);
+      return section;
+    }
+
+    const contentGrid = document.createElement("div");
+    contentGrid.className = "grid";
+    contentGrid.append(
+      this.createField("Content", this.createSelect(label.content, [
+        { value: "name", label: "Zone name" },
+        { value: "custom", label: "Custom text" },
+        { value: "name_state", label: "Zone name + entity state" },
+      ], (content) => {
+        this.updateZone(zoneIndex, (current) => ({
+          ...current,
+          label: { ...normalizeLabel(current.label), content },
+        }), true);
+      })),
+      this.createField("Position", this.createSelect(label.position_mode, [
+        { value: "auto", label: "Automatic center" },
+        { value: "custom", label: "Custom position" },
+      ], (positionMode) => {
+        this.updateZone(zoneIndex, (current) => ({
+          ...current,
+          label: {
+            ...normalizeLabel(current.label),
+            position_mode: positionMode,
+            position: positionMode === "custom"
+              ? normalizeLabel(current.label).position ?? zoneLabelPoint(current)
+              : normalizeLabel(current.label).position,
+          },
+        }), true);
+      })),
+    );
+    section.append(contentGrid);
+
+    if (label.content === "custom") {
+      section.append(this.createField("Custom text", this.createTextInput(
+        label.text,
+        zone.name || "Zone label",
+        (text) => this.updateZone(zoneIndex, (current) => ({
+          ...current,
+          label: { ...normalizeLabel(current.label), text },
+        })),
+      )));
+    }
+
+    if (label.position_mode === "custom") {
+      const positionRow = document.createElement("div");
+      positionRow.className = "label-position-row";
+      const point = zoneLabelPoint(zone);
+      const positionText = document.createElement("span");
+      positionText.className = "hint";
+      positionText.textContent = `Position: ${Math.round(point.x * 100)}%, ${Math.round(point.y * 100)}%`;
+      positionRow.append(
+        positionText,
+        this.createButton(
+          this._mode === "label-position" && this._labelZoneId === zone.id
+            ? "Positioning…"
+            : "Place label",
+          () => this.startLabelPositioning(zone.id),
+          { kind: "secondary", compact: true },
+        ),
+      );
+      section.append(positionRow);
+    }
+
+    const styleGrid = document.createElement("div");
+    styleGrid.className = "label-style-grid";
+    styleGrid.append(
+      this.createField("Text color", this.createColorInput(label.color, (color) => {
+        this.updateZone(zoneIndex, (current) => ({
+          ...current,
+          label: { ...normalizeLabel(current.label), color },
+        }));
+      })),
+      this.createField("Font size", this.createNumberInput(label.size, 8, 72, 1, (size) => {
+        this.updateZone(zoneIndex, (current) => ({
+          ...current,
+          label: { ...normalizeLabel(current.label), size },
+        }));
+      })),
+      this.createField("Font weight", this.createSelect(String(label.weight), [
+        { value: "400", label: "Normal" },
+        { value: "500", label: "Medium" },
+        { value: "600", label: "Semibold" },
+        { value: "700", label: "Bold" },
+      ], (weight) => {
+        this.updateZone(zoneIndex, (current) => ({
+          ...current,
+          label: { ...normalizeLabel(current.label), weight: Number(weight) },
+        }));
+      })),
+      this.createField("Text opacity", this.createOpacityControl(label.opacity, (opacity) => {
+        this.updateZone(zoneIndex, (current) => ({
+          ...current,
+          label: { ...normalizeLabel(current.label), opacity },
+        }));
+      })),
+    );
+    section.append(styleGrid);
+
+    section.append(this.createCheckbox("Background", label.background, (background) => {
+      this.updateZone(zoneIndex, (current) => ({
+        ...current,
+        label: { ...normalizeLabel(current.label), background },
+      }), true);
+    }));
+    if (label.background) {
+      const backgroundGrid = document.createElement("div");
+      backgroundGrid.className = "label-style-grid";
+      backgroundGrid.append(
+        this.createField("Background color", this.createColorInput(label.background_color, (backgroundColor) => {
+          this.updateZone(zoneIndex, (current) => ({
+            ...current,
+            label: { ...normalizeLabel(current.label), background_color: backgroundColor },
+          }));
+        })),
+        this.createField("Background opacity", this.createOpacityControl(label.background_opacity, (backgroundOpacity) => {
+          this.updateZone(zoneIndex, (current) => ({
+            ...current,
+            label: { ...normalizeLabel(current.label), background_opacity: backgroundOpacity },
+          }));
+        })),
+      );
+      section.append(backgroundGrid);
+    }
+
+    const hint = document.createElement("p");
+    hint.className = "hint";
+    hint.textContent = label.content === "name_state"
+      ? "The displayed state updates live and includes the Home Assistant unit of measurement when available."
+      : "Labels remain readable while zooming and stay independent from zone pulse/blink effects.";
+    section.append(hint);
+    return section;
+  }
+
   createStateRulesEditor(zone, zoneIndex) {
     const section = document.createElement("div");
     section.className = "state-rules";
@@ -2375,7 +2862,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
     const style = document.createElement("style");
     style.textContent = `
       :host { display:block; }
-      .editor,.zones,.zone-card,.field,.preview,.fallback-form,.native-form-wrapper,.state-rules,.style-box,.actions-editor,.auto-zoom-editor,.auto-zoom-card { display:grid; gap:10px; }
+      .editor,.zones,.zone-card,.field,.preview,.fallback-form,.native-form-wrapper,.state-rules,.style-box,.actions-editor,.label-editor,.auto-zoom-editor,.auto-zoom-card { display:grid; gap:10px; }
       .editor { gap:18px; }
       .field > span,.style-box-title { color:var(--primary-text-color); font-size:14px; font-weight:500; }
       input,select { box-sizing:border-box; width:100%; min-height:42px; padding:8px 12px; border:1px solid var(--divider-color,#c7c7c7); border-radius:8px; background:var(--card-background-color,#fff); color:var(--primary-text-color,#212121); font:inherit; }
@@ -2395,11 +2882,12 @@ class FloorplanZoneCardEditor extends HTMLElement {
       .native-form,.action-form { display:block; }
       .zone-native-form { margin-top:4px; }
       .grid,.style-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
-      .state-rules,.actions-editor { padding-top:4px; border-top:1px solid var(--divider-color,#ddd); }
+      .state-rules,.actions-editor,.label-editor { padding-top:4px; border-top:1px solid var(--divider-color,#ddd); }
       .auto-zoom-editor { padding:14px; border:1px solid var(--divider-color,#d0d0d0); border-radius:10px; }
       .auto-zoom-card { padding:12px; border:1px solid var(--divider-color,#ddd); border-radius:9px; }
       .auto-zoom-card.selected { border-color:var(--primary-color,#03a9f4); box-shadow:inset 0 0 0 1px var(--primary-color,#03a9f4); }
-      .focus-area-row { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+      .focus-area-row,.label-position-row { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+      .label-style-grid { display:grid; grid-template-columns:54px minmax(120px,.7fr) minmax(130px,.9fr) minmax(160px,1.2fr); gap:12px; align-items:end; }
       .state-rule-item { display:grid; gap:6px; }
       .state-rule-row { display:grid; grid-template-columns:minmax(110px,1fr) 54px minmax(140px,1fr) minmax(110px,.7fr) auto auto; gap:10px; align-items:center; padding:6px; border:1px solid transparent; border-radius:8px; }
       .state-rule-row.has-warning { border-color:var(--warning-color,#f57c00); background:color-mix(in srgb,var(--warning-color,#f57c00) 7%,transparent); }
@@ -2413,7 +2901,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
       .rule-warning { padding:0 6px; }
       .empty-rules { font-style:italic; }
       @media (max-width:700px) {
-        .grid,.style-grid { grid-template-columns:1fr; }
+        .grid,.style-grid,.label-style-grid { grid-template-columns:1fr; }
         .state-rule-row { grid-template-columns:minmax(0,1fr) 54px; }
         .state-rule-row .opacity-control,.state-rule-row select,.state-rule-row .checkbox-control { grid-column:1/-1; }
         .state-rule-delete { grid-column:1/-1; justify-self:end; }
@@ -2421,7 +2909,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
       @media (max-width:520px) {
         .zone-card > .section-title,.auto-zoom-card > .section-title { align-items:flex-start; flex-direction:column; }
         .zone-card > .section-title .toolbar,.auto-zoom-card > .section-title .toolbar { width:100%; }
-        .focus-area-row { align-items:flex-start; }
+        .focus-area-row,.label-position-row { align-items:flex-start; }
       }
     `;
 
@@ -2441,6 +2929,9 @@ class FloorplanZoneCardEditor extends HTMLElement {
       status.textContent = `Drawing · ${this._draftPoints.length} point${this._draftPoints.length === 1 ? "" : "s"}`;
     } else if (this._mode === "focus-area") {
       status.textContent = `Selecting auto-zoom area · Rule ${(this._focusRuleIndex ?? 0) + 1}`;
+    } else if (this._mode === "label-position") {
+      const zone = this._config.zones.find((item) => item.id === this._labelZoneId);
+      status.textContent = `Positioning label · ${zone?.name || "Zone"}`;
     } else if (this._mode === "edit") {
       status.textContent = this._selectedVertexIndex === null
         ? "Editing shape"
@@ -2468,6 +2959,9 @@ class FloorplanZoneCardEditor extends HTMLElement {
     canvas.addEventListener("floorplan-focus-area-commit", (event) => {
       this.commitFocusArea(event.detail.area);
     });
+    canvas.addEventListener("floorplan-label-position-commit", (event) => {
+      this.commitLabelPosition(event.detail.zoneId, event.detail.point);
+    });
     preview.append(previewTitle, canvas);
 
     const toolbar = document.createElement("div");
@@ -2484,6 +2978,10 @@ class FloorplanZoneCardEditor extends HTMLElement {
     } else if (this._mode === "focus-area") {
       toolbar.append(
         this.createButton("Cancel area selection", () => this.cancelFocusAreaSelection(), { kind: "danger" }),
+      );
+    } else if (this._mode === "label-position") {
+      toolbar.append(
+        this.createButton("Done positioning", () => this.finishLabelPositioning(), { kind: "secondary" }),
       );
     } else if (this._mode === "edit") {
       const zone = this._config.zones.find((item) => item.id === this._selectedZoneId);
@@ -2504,7 +3002,9 @@ class FloorplanZoneCardEditor extends HTMLElement {
 
     const interactionHint = document.createElement("p");
     interactionHint.className = "hint";
-    if (this._mode === "edit") {
+    if (this._mode === "label-position") {
+      interactionHint.textContent = "Click anywhere on the floorplan to place the label, or drag the label itself. Zoom and pan remain available; the saved position stays normalized to the image.";
+    } else if (this._mode === "edit") {
       interactionHint.textContent = "Drag a blue vertex to move it. Click a white midpoint to insert a vertex. Use the zoom controls or mouse wheel/pinch, and drag empty space to pan. Zone actions stay disabled while editing.";
     } else if (this._mode === "focus-area") {
       interactionHint.textContent = "Drag a rectangle around the area that should fill the view when this rule matches. You can still use wheel or pinch to zoom before drawing it.";
@@ -2522,7 +3022,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
     zoneTitle.className = "section-title";
     const heading = document.createElement("strong");
     heading.textContent = "Zones";
-    const add = this.createButton("Add zone", () => this.startDrawing(), { disabled: this._mode === "draw" || this._mode === "focus-area" });
+    const add = this.createButton("Add zone", () => this.startDrawing(), { disabled: this._mode === "draw" || this._mode === "focus-area" || this._mode === "label-position" });
     zoneTitle.append(heading, add);
     zones.append(zoneTitle);
 
@@ -2548,6 +3048,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
         this.createButton("Delete", () => {
           if (this._selectedZoneId === zone.id) {
             this._selectedZoneId = null;
+            if (this._labelZoneId === zone.id) this._labelZoneId = null;
             this._selectedVertexIndex = null;
             this._mode = "select";
           }
@@ -2564,6 +3065,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
       zoneCard.append(
         header,
         this.createZoneMetadataForm(zone, index),
+        this.createLabelEditor(zone, index),
         this.createActionsEditor(zone, index),
         this.createStateRulesEditor(zone, index),
       );
@@ -2591,7 +3093,7 @@ if (!window.customCards.some((card) => card.type === CARD_TYPE)) {
   window.customCards.push({
     type: CARD_TYPE,
     name: "Floorplan Zone Card",
-    description: "Display a zoomable floorplan with state-driven polygon zones and Home Assistant actions.",
+    description: "Display a zoomable floorplan with state-driven polygon zones, configurable labels and Home Assistant actions.",
     preview: true,
     documentationURL: "https://github.com/xtimmy86x/ha-floorplan-zone-card",
   });
