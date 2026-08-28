@@ -2,7 +2,7 @@ const CARD_TYPE = "floorplan-zone-card";
 const CARD_TAG = "floorplan-zone-card";
 const EDITOR_TAG = "floorplan-zone-card-editor";
 const CANVAS_TAG = "floorplan-zone-canvas";
-const VERSION = "0.1.0-dev.9";
+const VERSION = "0.1.0-dev.10";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const SVG_SIZE = 1000;
 
@@ -482,6 +482,7 @@ class FloorplanZoneCanvas extends HTMLElement {
     this._clickSuppressTimer = null;
     this._imageKey = null;
     this._resolvedImage = "";
+    this._imageAspectRatio = null;
     this._imageResolveToken = 0;
     this._viewTransitionTimer = null;
     this._resizeObserver = typeof ResizeObserver !== "undefined"
@@ -620,13 +621,19 @@ class FloorplanZoneCanvas extends HTMLElement {
     const { scale, centerX, centerY } = this._view;
     const panX = width / 2 - centerX * width * scale;
     const panY = height / 2 - centerY * height * scale;
-    transform.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
-    transform.style.transformOrigin = "0 0";
+    // Resize the render layer to the requested zoom instead of scaling a
+    // pre-rasterized 100% texture. This lets the browser sample the original
+    // floorplan image at the final CSS size and keeps raster plans sharper.
+    transform.style.width = `${scale * 100}%`;
+    transform.style.height = `${scale * 100}%`;
+    transform.style.transform = `translate(${panX}px, ${panY}px)`;
     transform.querySelectorAll("[data-screen-radius]").forEach((node) => {
       const baseRadius = Number(node.dataset.screenRadius);
       if (Number.isFinite(baseRadius)) node.setAttribute("r", String(baseRadius / scale));
     });
-    transform.style.setProperty("--label-counter-scale", String(1 / scale));
+    // HTML labels are positioned by the enlarged layout layer but are no
+    // longer themselves scaled, so they remain readable without counter-scale.
+    transform.style.setProperty("--label-counter-scale", "1");
     viewport.classList.toggle("zoomed", scale > MIN_ZOOM + 0.001);
     if (indicator) indicator.textContent = `${Math.round(scale * 100)}%`;
     if (zoomIn) zoomIn.disabled = scale >= MAX_ZOOM - 0.001;
@@ -1333,11 +1340,11 @@ class FloorplanZoneCanvas extends HTMLElement {
     const style = document.createElement("style");
     style.textContent = `
       :host { display:block; }
-      .canvas { position:relative; overflow:hidden; border-radius:var(--ha-card-border-radius,12px); background:var(--secondary-background-color,#eee); touch-action:none; }
-      .transform-layer { position:relative; width:100%; will-change:transform; }
-      .transform-layer.view-animated { transition:transform ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1); }
-      .transform-layer.empty { aspect-ratio:16/9; min-height:220px; }
-      img { display:block; width:100%; height:auto; user-select:none; pointer-events:none; }
+      .canvas { position:relative; overflow:hidden; border-radius:var(--ha-card-border-radius,12px); background:var(--secondary-background-color,#eee); touch-action:none; aspect-ratio:16/9; }
+      .canvas.empty-canvas { min-height:220px; }
+      .transform-layer { position:absolute; left:0; top:0; width:100%; height:100%; }
+      .transform-layer.view-animated { transition:transform ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1),width ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1),height ${AUTO_ZOOM_TRANSITION_MS}ms cubic-bezier(.2,.8,.2,1); }
+      .floorplan-image { display:block; width:100%; height:100%; image-rendering:auto; user-select:none; pointer-events:none; }
       svg { position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
       polygon.zone { vector-effect:non-scaling-stroke; transition:fill 160ms ease,fill-opacity 160ms ease,stroke 120ms ease,stroke-width 120ms ease,filter 80ms ease; }
       polygon.zone.effect-pulse { animation:zone-pulse 1.4s ease-in-out infinite; }
@@ -1393,6 +1400,9 @@ class FloorplanZoneCanvas extends HTMLElement {
 
     const container = document.createElement("div");
     container.className = "canvas";
+    container.style.aspectRatio = this._imageAspectRatio
+      ? String(this._imageAspectRatio)
+      : "16 / 9";
     container.addEventListener("wheel", (event) => this.handleWheel(event), { passive: false });
     container.addEventListener("pointerdown", (event) => this.handleTouchPointerDownCapture(event), true);
     container.addEventListener("pointermove", (event) => this.handleTouchPointerMoveCapture(event), true);
@@ -1404,11 +1414,19 @@ class FloorplanZoneCanvas extends HTMLElement {
 
     if (this._resolvedImage) {
       const img = document.createElement("img");
+      img.className = "floorplan-image";
       img.src = this._resolvedImage;
       img.alt = this._config?.title || "Floorplan";
-      img.addEventListener("load", () => this.applyCurrentView());
+      img.addEventListener("load", () => {
+        if (img.naturalWidth && img.naturalHeight) {
+          this._imageAspectRatio = img.naturalWidth / img.naturalHeight;
+          container.style.aspectRatio = String(this._imageAspectRatio);
+        }
+        this.applyCurrentView();
+      });
       transform.append(img);
     } else {
+      container.classList.add("empty-canvas");
       transform.classList.add("empty");
       const message = document.createElement("div");
       message.className = "empty-message";
@@ -1712,6 +1730,7 @@ class FloorplanZoneCanvas extends HTMLElement {
     if (!key) {
       this._imageKey = "";
       this._resolvedImage = "";
+      this._imageAspectRatio = null;
       this._imageResolveToken += 1;
       this.render();
       return;
@@ -1720,6 +1739,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       this.render();
       return;
     }
+    if (key !== this._imageKey) this._imageAspectRatio = null;
     this._imageKey = key;
     const token = ++this._imageResolveToken;
     if (!needsResolution) {

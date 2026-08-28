@@ -1,6 +1,6 @@
 {
   "name": "ha-floorplan-zone-card",
-  "version": "0.1.0-dev.9",
+  "version": "0.1.0-dev.10",
   "private": true,
   "type": "module",
   "description": "A visual Home Assistant floorplan card with state-driven polygon zones, native actions, zoom/pan, auto focus, animated effects, configurable zone labels and editor validation.",

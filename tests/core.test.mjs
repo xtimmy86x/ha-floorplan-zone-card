@@ -230,3 +230,13 @@ test("name plus state labels include Home Assistant units", () => {
   }));
   assert.deepEqual(lines, ["Boiler room", "23.4 °C"]);
 });
+
+
+test("raster zoom uses layout sizing instead of transform scaling", async () => {
+  const source = await readFile(new URL("../src/ha-floorplan-zone-card.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /will-change:transform/);
+  assert.match(source, /transform\.style\.width = `\$\{scale \* 100\}%`/);
+  assert.match(source, /transform\.style\.height = `\$\{scale \* 100\}%`/);
+  assert.match(source, /transform\.style\.transform = `translate\(\$\{panX\}px, \$\{panY\}px\)`/);
+  assert.doesNotMatch(source, /translate\(\$\{panX\}px, \$\{panY\}px\) scale\(\$\{scale\}\)/);
+});
