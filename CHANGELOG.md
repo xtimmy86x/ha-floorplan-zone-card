@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.0 - 2026-08-29
+
+### Added
+
+- Theme-aware floorplans with separate light/default and optional dark images.
+- Automatic floorplan switching when Home Assistant changes between light and dark mode, without reloading the dashboard.
+- Dark floorplan support for the same media selector objects, `/local/` paths, direct URLs, and `media-source://` values supported by the default image.
+- SVG-object compatibility checks across light and dark SVG floorplans, including missing object IDs and differing `viewBox` dimensions.
+- Active-theme SVG bounds for labels and auto-zoom so SVG-object zones follow the currently displayed floorplan geometry.
+
+### Changed
+
+- Floorplan image and SVG source resolution now follow the active Home Assistant theme.
+- The visual editor exposes dedicated Light / default and optional Dark floorplan selectors and shows the currently active floorplan theme in the workspace.
+
 ## 0.1.1 - 2026-08-28
 
 ### Changed

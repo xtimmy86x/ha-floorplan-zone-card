@@ -51,6 +51,11 @@ async function loadCore() {
     matchingAutoZoomRule,
     zoneFocusArea,
     effectiveAction,
+    imageContentId,
+    activeImageSource,
+    activeFloorplanTheme,
+    themeImageConfigKey,
+    dualThemeSvgWarnings,
   };`;
   vm.runInContext(source + expose, context, { filename: "ha-floorplan-zone-card.js" });
   return context.__core;
@@ -301,7 +306,7 @@ test("SVG object overlay uses the floorplan viewport directly", async () => {
 
 test("editor UI is container-responsive and collapsible", async () => {
   const source = await readFile(new URL("../src/ha-floorplan-zone-card.js", import.meta.url), "utf8");
-  assert.match(source, /const VERSION = "0\.1\.1"/);
+  assert.match(source, /const VERSION = "0\.2\.0"/);
   assert.match(source, /container-type:inline-size/);
   assert.match(source, /@container \(min-width:600px\)/);
   assert.match(source, /this\._workspaceOpen = false/);
@@ -311,4 +316,58 @@ test("editor UI is container-responsive and collapsible", async () => {
   assert.match(source, /Add zone/);
   assert.match(source, /Draw manually/);
   assert.doesNotMatch(source, /@media \(max-width:700px\)/);
+});
+
+
+
+test("theme-aware floorplans select the expected source", () => {
+  const config = {
+    image: "/local/light.svg",
+    image_dark: "/local/dark.svg",
+  };
+  assert.equal(core.activeImageSource(config, { themes: { darkMode: false } }), "/local/light.svg");
+  assert.equal(core.activeImageSource(config, { themes: { darkMode: true } }), "/local/dark.svg");
+  assert.equal(core.activeFloorplanTheme(config, { themes: { darkMode: false } }), "light");
+  assert.equal(core.activeFloorplanTheme(config, { themes: { darkMode: true } }), "dark");
+});
+
+test("dark mode falls back to the default floorplan when image_dark is absent", () => {
+  const config = { image: "/local/default.svg" };
+  assert.equal(core.activeImageSource(config, { themes: { darkMode: true } }), "/local/default.svg");
+  assert.equal(core.activeFloorplanTheme(config, { themes: { darkMode: true } }), "light");
+});
+
+test("theme-aware floorplans support Home Assistant media selector objects", () => {
+  const light = { media_content_id: "media-source://image_upload/light" };
+  const dark = { media_content_id: "media-source://image_upload/dark" };
+  const config = { image: light, image_dark: dark };
+  assert.equal(core.activeImageSource(config, { themes: { darkMode: false } }), light);
+  assert.equal(core.activeImageSource(config, { themes: { darkMode: true } }), dark);
+  assert.equal(core.imageContentId(core.activeImageSource(config, { themes: { darkMode: true } })), "media-source://image_upload/dark");
+  assert.equal(core.themeImageConfigKey(config), "media-source://image_upload/light|media-source://image_upload/dark");
+});
+
+test("dual SVG theme validation detects viewBox and missing object incompatibilities", () => {
+  const lightDescriptor = {
+    viewBox: "0 0 1600 900",
+    elementsById: new Map([["E-20", {}], ["E-30", {}]]),
+  };
+  const darkDescriptor = {
+    viewBox: "0 0 1920 1080",
+    elementsById: new Map([["E-20", {}]]),
+  };
+  const warnings = core.dualThemeSvgWarnings(lightDescriptor, darkDescriptor, [
+    { geometry: "svg", svg_element_id: "E-20" },
+    { geometry: "svg", svg_element_id: "E-30" },
+  ]);
+  assert.ok(warnings.some((warning) => warning.includes("different viewBox")));
+  assert.ok(warnings.some((warning) => warning === "Dark floorplan is missing SVG object #E-30."));
+});
+
+test("runtime source code reacts to Home Assistant darkMode changes", async () => {
+  const source = await readFile(new URL("../src/ha-floorplan-zone-card.js", import.meta.url), "utf8");
+  assert.match(source, /hass\?\.themes\?\.darkMode === true/);
+  assert.match(source, /activeImageSource\(this\._config, this\._hass\)/);
+  assert.match(source, /image_dark/);
+  assert.match(source, /Dark floorplan \(optional\)/);
 });
