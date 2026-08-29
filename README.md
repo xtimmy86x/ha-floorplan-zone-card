@@ -456,3 +456,18 @@ dist/ha-floorplan-zone-card.js
 ## License
 
 MIT
+
+
+## Theme-aware floorplans
+
+Starting with 0.2.0, the card can use different floorplan images for Home Assistant light and dark themes. The existing `image` option remains the default/light floorplan, while `image_dark` is optional:
+
+```yaml
+type: custom:floorplan-zone-card
+image: /local/floorplan_light.svg
+image_dark: /local/floorplan_dark.svg
+```
+
+The card switches automatically when Home Assistant changes theme. If `image_dark` is not configured, `image` is used for both themes.
+
+Both fields support the Home Assistant media/image selector, `/local/` paths, direct URLs, and media-source values. For SVG-object zones, keep the same object IDs in both SVG files (for example `id="E-20"`). The editor warns when a configured SVG zone is missing from one theme or when the two SVG files use different `viewBox` dimensions.

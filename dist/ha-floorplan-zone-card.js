@@ -2,7 +2,7 @@ const CARD_TYPE = "floorplan-zone-card";
 const CARD_TAG = "floorplan-zone-card";
 const EDITOR_TAG = "floorplan-zone-card-editor";
 const CANVAS_TAG = "floorplan-zone-canvas";
-const VERSION = "0.1.1";
+const VERSION = "0.2.0";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const SVG_SIZE = 1000;
 
@@ -280,7 +280,10 @@ function normalizeAutoZoomRule(rule) {
   };
 }
 
-function zoneFocusArea(zone) {
+function zoneFocusArea(zone, svgBoundsOverride = null) {
+  if (zoneUsesSvgObject(zone) && svgBoundsValid(svgBoundsOverride)) {
+    return normalizeSvgBounds(svgBoundsOverride);
+  }
   if (zoneUsesSvgObject(zone) && svgBoundsValid(zone?.svg_bounds)) {
     return normalizeSvgBounds(zone.svg_bounds);
   }
@@ -295,13 +298,16 @@ function zoneFocusArea(zone) {
   return focusAreaValid(area) ? area : null;
 }
 
-function autoZoomTargetArea(config, rule) {
+function autoZoomTargetArea(config, rule, svgBoundsByZoneId = null) {
   if (!rule) return null;
   if (rule.target === "area") {
     return focusAreaValid(rule.area) ? normalizeFocusArea(rule.area) : null;
   }
   const zone = (config?.zones ?? []).find((item) => item.id === rule.zone_id);
-  return zoneFocusArea(zone);
+  const activeBounds = zone?.id && svgBoundsByZoneId?.get
+    ? svgBoundsByZoneId.get(zone.id)
+    : null;
+  return zoneFocusArea(zone, activeBounds);
 }
 
 function viewForFocusArea(area, padding = AUTO_ZOOM_PADDING) {
@@ -317,12 +323,12 @@ function viewForFocusArea(area, padding = AUTO_ZOOM_PADDING) {
   });
 }
 
-function matchingAutoZoomRule(config, hass) {
+function matchingAutoZoomRule(config, hass, svgBoundsByZoneId = null) {
   const rules = config?.auto_zoom ?? [];
   for (let index = 0; index < rules.length; index += 1) {
     const rule = rules[index];
     if (!rule?.entity || entityRawState(hass, rule.entity) !== rule.state) continue;
-    const area = autoZoomTargetArea(config, rule);
+    const area = autoZoomTargetArea(config, rule, svgBoundsByZoneId);
     if (area) return { index, rule, area };
   }
   return null;
@@ -487,6 +493,31 @@ function imageContentId(image) {
   return "";
 }
 
+function activeImageSource(config, hass) {
+  const darkMode = hass?.themes?.darkMode === true;
+  const darkImage = config?.image_dark;
+  return darkMode && imageContentId(darkImage) ? darkImage : config?.image;
+}
+
+function activeFloorplanTheme(config, hass) {
+  return hass?.themes?.darkMode === true && imageContentId(config?.image_dark)
+    ? "dark"
+    : "light";
+}
+
+function themeImageConfigKey(config) {
+  return `${imageContentId(config?.image)}|${imageContentId(config?.image_dark)}`;
+}
+
+function themeCompatibilityKey(config) {
+  const zoneIds = (config?.zones ?? [])
+    .filter(zoneUsesSvgObject)
+    .map((zone) => zone.svg_element_id)
+    .sort()
+    .join(",");
+  return `${themeImageConfigKey(config)}|${zoneIds}`;
+}
+
 function isMediaSourceContentId(value) {
   return typeof value === "string" && value.startsWith("media-source://");
 }
@@ -608,6 +639,49 @@ function parseSvgSource(text) {
     preserveAspectRatio: root.getAttribute("preserveAspectRatio") || "xMidYMid meet",
     aspectRatio,
   };
+}
+
+function svgViewBoxParts(descriptor) {
+  return String(descriptor?.viewBox ?? "")
+    .trim()
+    .split(/[\s,]+/)
+    .map(Number)
+    .filter((value) => Number.isFinite(value));
+}
+
+function dualThemeSvgWarnings(lightDescriptor, darkDescriptor, zones = []) {
+  if (!lightDescriptor || !darkDescriptor) return [];
+  const warnings = [];
+  const lightViewBox = svgViewBoxParts(lightDescriptor);
+  const darkViewBox = svgViewBoxParts(darkDescriptor);
+  if (
+    lightViewBox.length === 4 &&
+    darkViewBox.length === 4 &&
+    lightViewBox.some((value, index) => Math.abs(value - darkViewBox[index]) > 1e-9)
+  ) {
+    warnings.push("Light and dark SVG floorplans use different viewBox dimensions. SVG zones may not align identically.");
+  }
+
+  const lightIds = lightDescriptor.elementsById ?? new Map();
+  const darkIds = darkDescriptor.elementsById ?? new Map();
+  const usedIds = [...new Set((zones ?? []).filter(zoneUsesSvgObject).map((zone) => zone.svg_element_id))];
+  for (const id of usedIds) {
+    if (!lightIds.has(id)) warnings.push(`Light floorplan is missing SVG object #${id}.`);
+    if (!darkIds.has(id)) warnings.push(`Dark floorplan is missing SVG object #${id}.`);
+  }
+  return warnings;
+}
+
+async function inspectSvgImage(hass, image, zones = []) {
+  const configured = imageContentId(image);
+  if (!configured) return null;
+  const url = await resolveImageSource(hass, image);
+  if (!url || !likelySvgSource(image, url, zones)) return null;
+  const response = await fetch(url, { credentials: "same-origin", cache: "force-cache" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const parsed = parseSvgSource(await response.text());
+  if (!parsed) throw new Error("The selected image is not a readable SVG document.");
+  return parsed;
 }
 
 function copySvgGeometryAttributes(sourceElement, targetElement) {
@@ -784,7 +858,7 @@ class FloorplanZoneCanvas extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    const key = imageContentId(this._config?.image);
+    const key = imageContentId(activeImageSource(this._config, this._hass));
     if (key && key === this._imageKey && this._resolvedImage) {
       this.updateZoneVisualStates();
       this.updateZoneLabels();
@@ -1493,6 +1567,16 @@ class FloorplanZoneCanvas extends HTMLElement {
           status: this._svgSourceStatus,
           error: this._svgSourceError,
           elements: entries,
+          theme: activeFloorplanTheme(this._config, this._hass),
+          zone_bounds: Object.fromEntries(
+            (this._config?.zones ?? [])
+              .filter(zoneUsesSvgObject)
+              .map((zone) => {
+                const bounds = entries.find((entry) => entry.id === zone.svg_element_id)?.bounds;
+                return [zone.id, svgBoundsValid(bounds) ? normalizeSvgBounds(bounds) : null];
+              })
+              .filter(([, bounds]) => bounds),
+          ),
         },
       }),
     );
@@ -1513,7 +1597,8 @@ class FloorplanZoneCanvas extends HTMLElement {
     this._svgSourceError = "";
     const token = ++this._svgSourceToken;
 
-    if (!likelySvgSource(this._config?.image, url, this._config?.zones ?? [])) {
+    const configuredImage = activeImageSource(this._config, this._hass);
+    if (!likelySvgSource(configuredImage, url, this._config?.zones ?? [])) {
       this._svgSourceStatus = "none";
       this.emitSvgSourceChanged();
       return;
@@ -1523,7 +1608,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       const response = await fetch(url, { credentials: "same-origin", cache: "force-cache" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const contentType = response.headers.get("content-type") ?? "";
-      const explicitlySvg = /\.svg(?:$|[?#])/i.test(url) || /\.svg(?:$|[?#])/i.test(imageContentId(this._config?.image));
+      const explicitlySvg = /\.svg(?:$|[?#])/i.test(url) || /\.svg(?:$|[?#])/i.test(imageContentId(configuredImage));
       const requiredByConfig = (this._config?.zones ?? []).some(zoneUsesSvgObject);
       if (!contentType.toLowerCase().includes("svg") && !explicitlySvg && !requiredByConfig) {
         if (token !== this._svgSourceToken) return;
@@ -1759,7 +1844,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       focusArea,
       labelZoneId,
     } = this._editorState;
-    const imageConfigured = Boolean(imageContentId(this._config?.image));
+    const imageConfigured = Boolean(imageContentId(activeImageSource(this._config, this._hass)));
 
     const style = document.createElement("style");
     style.textContent = `
@@ -1990,11 +2075,16 @@ class FloorplanZoneCanvas extends HTMLElement {
     labelsLayer.className = "zone-label-layer";
     for (const zone of this._config?.zones ?? []) {
       const label = normalizeLabel(zone.label);
+      const activeSvgBounds = zoneUsesSvgObject(zone)
+        ? this.svgElementBounds(zone.svg_element_id) ?? zone.svg_bounds
+        : null;
       const hasGeometry = zoneUsesSvgObject(zone)
-        ? svgBoundsValid(zone.svg_bounds)
+        ? svgBoundsValid(activeSvgBounds)
         : Array.isArray(zone.points) && zone.points.length >= 3;
       if (!label.enabled || !hasGeometry) continue;
-      const point = zoneLabelPoint(zone);
+      const point = zoneLabelPoint(
+        zoneUsesSvgObject(zone) ? { ...zone, svg_bounds: activeSvgBounds } : zone,
+      );
       const anchor = document.createElement("div");
       anchor.className = "zone-label-anchor";
       anchor.dataset.zoneId = zone.id ?? "";
@@ -2195,7 +2285,8 @@ class FloorplanZoneCanvas extends HTMLElement {
   }
 
   async refreshImage() {
-    const key = imageContentId(this._config?.image);
+    const configuredImage = activeImageSource(this._config, this._hass);
+    const key = imageContentId(configuredImage);
     const needsResolution = isMediaSourceContentId(key);
     if (!key) {
       this._imageKey = "";
@@ -2228,7 +2319,7 @@ class FloorplanZoneCanvas extends HTMLElement {
     this.render();
     if (!this._hass) return;
     try {
-      const resolved = await resolveImageSource(this._hass, this._config?.image);
+      const resolved = await resolveImageSource(this._hass, configuredImage);
       if (token !== this._imageResolveToken || key !== this._imageKey) return;
       this._resolvedImage = resolved;
     } catch (error) {
@@ -2250,6 +2341,8 @@ class FloorplanZoneCard extends HTMLElement {
     this._viewState = normalizeViewState();
     this._activeAutoZoomIndex = null;
     this._autoZoomRestoreView = null;
+    this._activeSvgBounds = new Map();
+    this._activeImageKey = "";
   }
 
   static getConfigElement() {
@@ -2267,11 +2360,19 @@ class FloorplanZoneCard extends HTMLElement {
     this._config = normalizedConfig(config);
     this._activeAutoZoomIndex = null;
     this._autoZoomRestoreView = null;
+    this._activeSvgBounds = new Map();
+    this._activeImageKey = imageContentId(activeImageSource(this._config, this._hass));
     this.render();
   }
 
   set hass(hass) {
+    const previousImageKey = this._activeImageKey;
     this._hass = hass;
+    this._activeImageKey = imageContentId(activeImageSource(this._config, this._hass));
+    if (previousImageKey && previousImageKey !== this._activeImageKey) {
+      this._activeSvgBounds = new Map();
+      this._activeAutoZoomIndex = null;
+    }
     const canvas = this.shadowRoot?.querySelector(CANVAS_TAG);
     if (canvas) {
       canvas.hass = hass;
@@ -2281,7 +2382,7 @@ class FloorplanZoneCard extends HTMLElement {
 
   evaluateAutoZoom(canvas) {
     if (!canvas || !this._config || !this._hass) return;
-    const match = matchingAutoZoomRule(this._config, this._hass);
+    const match = matchingAutoZoomRule(this._config, this._hass, this._activeSvgBounds);
     const previousIndex = this._activeAutoZoomIndex;
 
     if (match && previousIndex === match.index) return;
@@ -2341,12 +2442,18 @@ class FloorplanZoneCard extends HTMLElement {
     const content = document.createElement("div");
     content.className = "content";
     const canvas = document.createElement(CANVAS_TAG);
-    canvas.viewState = this._viewState;
-    canvas.config = this._config;
-    canvas.hass = this._hass;
     canvas.addEventListener("floorplan-view-changed", (event) => {
       this._viewState = normalizeViewState(event.detail?.viewState);
     });
+    canvas.addEventListener("floorplan-svg-source-changed", (event) => {
+      this._activeSvgBounds = new Map(
+        Object.entries(event.detail?.zone_bounds ?? {}).map(([zoneId, bounds]) => [zoneId, bounds]),
+      );
+      this.evaluateAutoZoom(canvas);
+    });
+    canvas.viewState = this._viewState;
+    canvas.config = this._config;
+    canvas.hass = this._hass;
     content.append(canvas);
     card.append(content);
     this.shadowRoot.append(style, card);
@@ -2375,12 +2482,15 @@ class FloorplanZoneCardEditor extends HTMLElement {
     this._haFormReadyListener = null;
     this._workspaceOpen = false;
     this._expandedZoneIds = new Set();
+    this._themeCompatibilityWarnings = [];
+    this._themeCompatibilityKey = "";
+    this._themeCompatibilityToken = 0;
   }
 
   setConfig(config) {
-    const previousImage = imageContentId(this._config?.image);
+    const previousImages = themeImageConfigKey(this._config);
     this._config = normalizedConfig(config);
-    if (previousImage !== imageContentId(this._config?.image)) {
+    if (previousImages !== themeImageConfigKey(this._config)) {
       this._svgElements = [];
       this._svgSourceError = "";
       this._selectedSvgElementId = "";
@@ -2411,6 +2521,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
       this._focusRuleIndex = null;
       if (this._mode === "focus-area") this._mode = "select";
     }
+    this.refreshThemeCompatibility();
     this.render();
   }
 
@@ -2419,6 +2530,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
     const canvas = this.shadowRoot?.querySelector(CANVAS_TAG);
     if (canvas) canvas.hass = hass;
     this.shadowRoot?.querySelectorAll("ha-form").forEach((form) => { form.hass = hass; });
+    this.refreshThemeCompatibility();
   }
 
   get hass() {
@@ -2519,7 +2631,10 @@ class FloorplanZoneCardEditor extends HTMLElement {
       zones[index] = normalizeZone({ ...zone, svg_bounds: normalized });
       boundsChanged = true;
     });
-    if (boundsChanged) {
+    if (
+      boundsChanged &&
+      (activeFloorplanTheme(this._config, this._hass) === "light" || !imageContentId(this._config?.image_dark))
+    ) {
       this._config = { ...this._config, zones };
       this.emitConfigChanged();
     }
@@ -2527,6 +2642,44 @@ class FloorplanZoneCardEditor extends HTMLElement {
     if (previousCatalog !== nextCatalog || nextError !== (this._lastSvgSourceError ?? "") || boundsChanged) {
       this._lastSvgSourceError = nextError;
       this.render();
+    }
+  }
+
+  async refreshThemeCompatibility() {
+    const key = themeCompatibilityKey(this._config);
+    const hasDarkImage = Boolean(imageContentId(this._config?.image_dark));
+    if (!this._hass || !hasDarkImage) {
+      const hadWarnings = this._themeCompatibilityWarnings.length > 0;
+      this._themeCompatibilityKey = key;
+      this._themeCompatibilityWarnings = [];
+      if (hadWarnings && this.isConnected) this.render();
+      return;
+    }
+    if (key === this._themeCompatibilityKey) return;
+    this._themeCompatibilityKey = key;
+    const token = ++this._themeCompatibilityToken;
+    try {
+      const [lightDescriptor, darkDescriptor] = await Promise.all([
+        inspectSvgImage(this._hass, this._config?.image, this._config?.zones ?? []),
+        inspectSvgImage(this._hass, this._config?.image_dark, this._config?.zones ?? []),
+      ]);
+      if (token !== this._themeCompatibilityToken || key !== this._themeCompatibilityKey) return;
+      const warnings = dualThemeSvgWarnings(
+        lightDescriptor,
+        darkDescriptor,
+        this._config?.zones ?? [],
+      );
+      if (JSON.stringify(warnings) !== JSON.stringify(this._themeCompatibilityWarnings)) {
+        this._themeCompatibilityWarnings = warnings;
+        if (this.isConnected) this.render();
+      }
+    } catch (error) {
+      if (token !== this._themeCompatibilityToken || key !== this._themeCompatibilityKey) return;
+      const warning = `Unable to compare light and dark SVG floorplans: ${error instanceof Error ? error.message : String(error)}`;
+      if (this._themeCompatibilityWarnings.length !== 1 || this._themeCompatibilityWarnings[0] !== warning) {
+        this._themeCompatibilityWarnings = [warning];
+        if (this.isConnected) this.render();
+      }
     }
   }
 
@@ -2881,12 +3034,21 @@ class FloorplanZoneCardEditor extends HTMLElement {
       wrapper.className = "fallback-form";
       wrapper.append(
         this.createField("Title", this.createTextInput(this._config.title, "Optional title", (value) => this.updateConfig({ title: value }))),
-        this.createField("Floorplan image URL", this.createTextInput(
+        this.createField("Light / default floorplan URL", this.createTextInput(
           typeof this._config.image === "string" ? this._config.image : "",
-          "/local/floorplan.png",
+          "/local/floorplan_light.svg",
           (value) => this.updateConfig({ image: value }),
         )),
+        this.createField("Dark floorplan URL (optional)", this.createTextInput(
+          typeof this._config.image_dark === "string" ? this._config.image_dark : "",
+          "/local/floorplan_dark.svg",
+          (value) => this.updateConfig({ image_dark: value }),
+        )),
       );
+      const hint = document.createElement("p");
+      hint.className = "hint";
+      hint.textContent = "If no dark floorplan is configured, the light/default floorplan is used for both Home Assistant themes.";
+      wrapper.append(hint);
       return wrapper;
     }
 
@@ -2894,12 +3056,22 @@ class FloorplanZoneCardEditor extends HTMLElement {
     form.className = "native-form";
     form.hass = this._hass;
     const legacyImage = typeof this._config.image === "string" ? this._config.image : undefined;
-    form.data = { title: this._config.title ?? "", image: legacyImage ? undefined : this._config.image };
+    const legacyDarkImage = typeof this._config.image_dark === "string" ? this._config.image_dark : undefined;
+    form.data = {
+      title: this._config.title ?? "",
+      image: legacyImage ? undefined : this._config.image,
+      image_dark: legacyDarkImage ? undefined : this._config.image_dark,
+    };
     form.schema = [
       { name: "title", selector: { text: {} } },
       { name: "image", selector: { media: { accept: ["image/*"], image_upload: true, clearable: true, hide_content_type: true } } },
+      { name: "image_dark", selector: { media: { accept: ["image/*"], image_upload: true, clearable: true, hide_content_type: true } } },
     ];
-    form.computeLabel = (schema) => (schema.name === "title" ? "Title" : "Floorplan image");
+    form.computeLabel = (schema) => {
+      if (schema.name === "title") return "Title";
+      if (schema.name === "image_dark") return "Dark floorplan (optional)";
+      return "Light / default floorplan";
+    };
     form.addEventListener("value-changed", (event) => {
       event.stopPropagation();
       const value = event.detail?.value ?? {};
@@ -2909,16 +3081,36 @@ class FloorplanZoneCardEditor extends HTMLElement {
       } else {
         patch.image = value.image;
       }
+      if (legacyDarkImage) {
+        if (value.image_dark) patch.image_dark = value.image_dark;
+      } else {
+        patch.image_dark = value.image_dark;
+      }
       this.updateConfig(patch);
+      this.refreshThemeCompatibility();
     });
-    if (!legacyImage) return form;
+
     const wrapper = document.createElement("div");
     wrapper.className = "native-form-wrapper";
     wrapper.append(form);
     const hint = document.createElement("p");
     hint.className = "hint";
-    hint.textContent = "This card still uses a legacy image URL/path. You can keep it or replace it with the Home Assistant image picker above.";
-    wrapper.append(hint, this.createField("Legacy image URL/path", this.createTextInput(legacyImage, "/local/floorplan.png", (value) => this.updateConfig({ image: value }))));
+    hint.textContent = "The dark floorplan is optional. Home Assistant theme changes are applied automatically; without a dark image, the default floorplan is used for both themes.";
+    wrapper.append(hint);
+    if (legacyImage) {
+      wrapper.append(this.createField("Legacy light/default image URL/path", this.createTextInput(
+        legacyImage,
+        "/local/floorplan_light.svg",
+        (value) => this.updateConfig({ image: value }),
+      )));
+    }
+    if (legacyDarkImage) {
+      wrapper.append(this.createField("Legacy dark image URL/path", this.createTextInput(
+        legacyDarkImage,
+        "/local/floorplan_dark.svg",
+        (value) => this.updateConfig({ image_dark: value }),
+      )));
+    }
     return wrapper;
   }
 
@@ -3606,6 +3798,17 @@ class FloorplanZoneCardEditor extends HTMLElement {
     const editor = document.createElement("div");
     editor.className = "editor";
     editor.append(this.createCardForm());
+    if (this._themeCompatibilityWarnings.length) {
+      const warningBox = document.createElement("div");
+      warningBox.className = "theme-compatibility-warnings";
+      this._themeCompatibilityWarnings.forEach((message) => {
+        const warning = document.createElement("p");
+        warning.className = "validation-warning";
+        warning.textContent = message;
+        warningBox.append(warning);
+      });
+      editor.append(warningBox);
+    }
 
     const workspace = document.createElement("section");
     workspace.className = "workspace section-panel";
@@ -3621,7 +3824,10 @@ class FloorplanZoneCardEditor extends HTMLElement {
     previewHeading.textContent = "Floorplan workspace";
     const workspaceHint = document.createElement("span");
     workspaceHint.className = "hint";
-    workspaceHint.textContent = "Open only when you need to draw, edit, position labels, or select focus areas.";
+    const themeLabel = activeFloorplanTheme(this._config, this._hass) === "dark"
+      ? "Dark floorplan"
+      : "Light / default floorplan";
+    workspaceHint.textContent = `${themeLabel} · Open only when you need to draw, edit, position labels, or select focus areas.`;
     workspaceHeading.append(previewHeading, workspaceHint);
 
     const workspaceHeaderActions = document.createElement("div");
