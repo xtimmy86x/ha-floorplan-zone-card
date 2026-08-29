@@ -30,3 +30,35 @@ jobs:
           # Repository metadata/images will be completed before any future
           # submission to the HACS default repository list.
           ignore: description topics images
+
+  theme_020_patch:
+    needs: [build, hacs]
+    if: "${{ github.event_name == 'pull_request' && github.head_ref == 'feature-theme-floorplans-0.2.0' }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feature-theme-floorplans-0.2.0
+          fetch-depth: 3
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Apply theme-aware floorplans
+        run: python scripts/apply_theme_floorplans_020.py
+      - name: Validate source
+        run: npm run check
+      - name: Build distribution
+        run: npm run build
+      - name: Ensure source and distribution match
+        run: cmp src/ha-floorplan-zone-card.js dist/ha-floorplan-zone-card.js
+      - name: Commit 0.2.0 feature
+        shell: bash
+        run: |
+          git rm scripts/apply_theme_floorplans_020.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(theme): add light and dark floorplans"
+          git push origin feature-theme-floorplans-0.2.0
