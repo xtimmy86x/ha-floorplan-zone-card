@@ -30,3 +30,37 @@ jobs:
           # Repository metadata/images will be completed before any future
           # submission to the HACS default repository list.
           ignore: description topics images
+
+  release_020:
+    needs: [build, hacs]
+    if: "${{ github.event_name == 'push' && github.event.head_commit.message == 'chore: publish v0.2.0' }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ca52d15e2d5aec21469a9be386fb057ce5c1a820
+      - name: Publish v0.2.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v0.2.0 dist/ha-floorplan-zone-card.js \
+            --target ca52d15e2d5aec21469a9be386fb057ce5c1a820 \
+            --title "Floorplan Zone Card 0.2.0" \
+            --notes "## Floorplan Zone Card 0.2.0
+
+This release adds theme-aware floorplans for Home Assistant.
+
+### Added
+- Separate light/default and optional dark floorplan images.
+- Automatic switching when Home Assistant changes between light and dark mode, without reloading the dashboard.
+- Dark floorplan support for Home Assistant media/image selectors, /local/ paths, direct URLs, and media-source:// values.
+- SVG-object compatibility checks across light and dark SVG floorplans.
+- Active-theme SVG bounds for labels and auto-zoom.
+
+### Changed
+- Floorplan image and SVG source resolution now follow the active Home Assistant theme.
+- The visual editor now exposes Light / default and Dark floorplan selectors and shows the active theme in the workspace.
+
+Existing configurations remain compatible and do not require migration."
