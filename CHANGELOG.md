@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Multi-entity conditions for a single floorplan zone, each with exact state matching, color, opacity, pulse/blink and highlighted border.
+- Configurable priority per condition (higher wins); tied priorities resolve in configured order.
+- Visual editor controls for additional entity conditions and primary-entity priority.
+
+### Changed
+
+- An unavailable entity no longer hides an active matching condition from another entity; fallback applies when at least one watched entity is available.
+- Existing single-entity zones and saved YAML remain compatible.
+
 ## 0.2.1 - 2026-10-27
 
 ### Fixed

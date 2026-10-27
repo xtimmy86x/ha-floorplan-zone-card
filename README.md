@@ -144,11 +144,38 @@ When `highlight_border: true`, the active state's color is also used for a thick
 
 Animations honor the browser/operating-system `prefers-reduced-motion` setting. In reduced-motion mode the zone keeps its active static color and border without blinking or pulsing.
 
-Rules are evaluated in this order:
+Rules work as before for single-entity zones, but a zone can also monitor multiple entities using `entity_rules` (each condition has its own color, opacity, pulse/blink effect, border highlighting, and priority).
 
-1. missing, `unknown`, or `unavailable` entity state → `unavailable` style;
-2. first exact matching entry in `states` → that rule's style;
-3. no matching rule → `default` fallback style.
+```yaml
+entity: binary_sensor.e20_running
+priority: 0 # existing primary entity
+states:
+  - value: "on"
+    color: "#00c853"
+    opacity: 0.35
+
+entity_rules:
+  - entity: binary_sensor.e20_warning
+    state: "on"
+    priority: 10
+    color: "#ffd600"
+    opacity: 0.45
+    effect: pulse
+    highlight_border: true
+  - entity: binary_sensor.e20_alarm
+    state: "on"
+    priority: 100
+    color: "#ff1744"
+    opacity: 0.6
+    effect: blink
+    highlight_border: true
+```
+
+This example shows **green while running**, **yellow on warning**, and **red blinking on alarm**. Priority is a signed integer from `-1000` to `1000`; **higher priority wins**. If multiple matching conditions share the same priority, the **primary entity wins first**, then the **first matching additional rule**. Priorities apply only to matching conditions; an entity in another state does not override a matching lower-priority condition.
+
+When nothing matches, the zone uses the `default` style if at least one watched entity is available. The `unavailable` style is used when **all configured entities are missing, unknown, or unavailable**. A missing entity does not hide a valid matching condition from another entity. Reserved `unknown` and `unavailable` values remain unavailable-only and cannot be configured as normal additional conditions.
+
+The existing `entity` and `states` are still fully supported; no migration is needed. The visual editor exposes **Primary entity priority** and **Additional entity conditions**, with an **Add condition** button and per-condition entity/state, priority, color, opacity, effect, border toggle and delete controls. The zone's label still uses the primary entity for the `name_state` option (or the first additional entity when there is no primary entity).
 
 The visual editor provides **Add state** and **Delete** controls and does not impose a limit on the number of state rules. Each row also includes an **Effect** selector and a **Highlight border** flag.
 

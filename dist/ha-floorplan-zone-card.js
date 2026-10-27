@@ -184,10 +184,10 @@ function entityDisplayState(hass, entityId) {
 
 function zoneLabelLines(hass, zone) {
   const label = normalizeLabel(zone?.label);
-  const name = zone?.name || zone?.entity || zone?.id || "Zone";
+  const name = zone?.name || zone?.entity || zone?.entity_rules?.[0]?.entity || zone?.id || "Zone";
   if (label.content === "custom") return [label.text || name];
   if (label.content === "name_state") {
-    const state = entityDisplayState(hass, zone?.entity);
+    const state = entityDisplayState(hass, zone?.entity || zone?.entity_rules?.[0]?.entity);
     return state ? [name, state] : [name];
   }
   return [name];
@@ -200,6 +200,36 @@ function normalizeStateRule(rule) {
     effect: STATE_EFFECTS.has(rule?.effect) ? rule.effect : "none",
     highlight_border: rule?.highlight_border === true,
   };
+}
+
+function normalizePriority(value, fallback = 0) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(-1000, Math.min(1000, Math.trunc(number))) : fallback;
+}
+
+function normalizeEntityRule(rule) {
+  const style = normalizeStateRule({ ...rule, value: rule?.state });
+  return {
+    entity: typeof rule?.entity === "string" ? rule.entity.trim() : "",
+    state: style.value,
+    priority: normalizePriority(rule?.priority, 10),
+    color: style.color,
+    opacity: style.opacity,
+    effect: style.effect,
+    highlight_border: style.highlight_border,
+  };
+}
+
+function newEntityRule() {
+  return normalizeEntityRule({
+    entity: "",
+    state: "on",
+    priority: 10,
+    ...DEFAULT_ON_STYLE,
+    effect: "none",
+    highlight_border: false,
+  });
 }
 
 function stateRuleValidation(states) {
@@ -377,6 +407,10 @@ function normalizeZone(zone) {
     states: Array.isArray(zone?.states)
       ? zone.states.map(normalizeStateRule)
       : legacyStateRules(zone),
+    priority: normalizePriority(zone?.priority, 0),
+    entity_rules: Array.isArray(zone?.entity_rules)
+      ? zone.entity_rules.map(normalizeEntityRule)
+      : [],
     default: normalizeStyle(zone?.default, DEFAULT_FALLBACK_STYLE),
     unavailable: normalizeStyle(zone?.unavailable, DEFAULT_UNAVAILABLE_STYLE),
     stroke: {
@@ -424,6 +458,8 @@ function createZone(points, zones) {
     id,
     name: `Zone ${number}`,
     entity: "",
+    priority: 0,
+    entity_rules: [],
     geometry: "polygon",
     points: points.map(normalizePoint),
     states: [
@@ -449,6 +485,8 @@ function createSvgZone(element, bounds, zones) {
     id,
     name: title || elementId || `SVG Zone ${number}`,
     entity: "",
+    priority: 0,
+    entity_rules: [],
     geometry: "svg",
     svg_element_id: elementId,
     svg_bounds: svgBoundsValid(bounds) ? normalizeSvgBounds(bounds) : undefined,
@@ -472,13 +510,50 @@ function entityRawState(hass, entityId) {
   return hass?.states?.[entityId]?.state;
 }
 
-function stateStyle(hass, zone) {
-  const state = entityRawState(hass, zone.entity);
-  if (state === undefined || UNAVAILABLE_ENTITY_STATES.has(state)) {
-    return zone.unavailable ?? DEFAULT_UNAVAILABLE_STYLE;
+function resolvedZoneState(hass, zone) {
+  let winner = null;
+  const watchedEntities = [zone.entity, ...(zone.entity_rules ?? []).map((rule) => rule.entity)]
+    .filter(Boolean);
+  const hasAvailableEntity = watchedEntities.some((entity) => {
+    const state = entityRawState(hass, entity);
+    return state !== undefined && !UNAVAILABLE_ENTITY_STATES.has(state);
+  });
+
+  // The existing primary entity stays at priority 0 unless configured otherwise.
+  // Equal priorities use configured order: primary first, then additional rules.
+  const consider = (entity, expectedState, priority, style) => {
+    if (!entity) return;
+    const actualState = entityRawState(hass, entity);
+    if (actualState === undefined || UNAVAILABLE_ENTITY_STATES.has(actualState)) return;
+    if (expectedState !== actualState) return;
+    if (!winner || priority > winner.priority) {
+      winner = { style, priority, entity, state: actualState };
+    }
+  };
+
+  const primaryPriority = normalizePriority(zone.priority, 0);
+  for (const rule of zone.states ?? []) {
+    consider(zone.entity, String(rule.value), primaryPriority, rule);
   }
-  const rule = (zone.states ?? []).find((item) => String(item.value) === state);
-  return rule ?? zone.default ?? DEFAULT_FALLBACK_STYLE;
+  for (const rule of zone.entity_rules ?? []) {
+    if (rule.state === "" || UNAVAILABLE_ENTITY_STATES.has(rule.state)) continue;
+    consider(rule.entity, String(rule.state), normalizePriority(rule.priority, 10), rule);
+  }
+  if (winner) return winner;
+
+  // A single unavailable entity must not mask the fallback of another
+  // connected entity. Use unavailable only if no watched entity is available.
+  return {
+    style: hasAvailableEntity
+      ? zone.default ?? DEFAULT_FALLBACK_STYLE
+      : zone.unavailable ?? DEFAULT_UNAVAILABLE_STYLE,
+    entity: zone.entity,
+    state: entityRawState(hass, zone.entity),
+  };
+}
+
+function stateStyle(hass, zone) {
+  return resolvedZoneState(hass, zone).style;
 }
 
 function pointList(points) {
@@ -1699,8 +1774,9 @@ class FloorplanZoneCanvas extends HTMLElement {
 
   applyZoneVisualState(polygon, zone) {
     if (!polygon || !zone) return;
-    const zoneStyle = stateStyle(this._hass, zone);
-    const rawState = entityRawState(this._hass, zone.entity);
+    const resolved = resolvedZoneState(this._hass, zone);
+    const zoneStyle = resolved.style;
+    const rawState = resolved.state;
     const accessibleName = zone.name || zone.entity || zone.id || "Zone";
     const fillOpacity = zoneStyle.opacity ?? DEFAULT_FALLBACK_STYLE.opacity;
     const effect = STATE_EFFECTS.has(zoneStyle.effect) ? zoneStyle.effect : "none";
@@ -1733,7 +1809,7 @@ class FloorplanZoneCanvas extends HTMLElement {
       title = document.createElementNS(SVG_NS, "title");
       polygon.append(title);
     }
-    title.textContent = `${accessibleName}${rawState !== undefined ? ` · ${rawState}` : ""}`;
+    title.textContent = `${accessibleName}${rawState !== undefined ? ` · ${resolved.entity ? `${resolved.entity}: ` : ""}${rawState}` : ""}`;
   }
 
   updateZoneVisualStates() {
@@ -3582,8 +3658,12 @@ class FloorplanZoneCardEditor extends HTMLElement {
     section.append(headingRow);
     const description = document.createElement("p");
     description.className = "hint";
-    description.textContent = "Match the entity raw state exactly, then choose its color, opacity, visual effect and optional active border. The live preview uses the entity's current raw state.";
+    description.textContent = "These states belong to the primary zone entity. Match its raw state exactly and set a color, opacity, effect, and border. Higher priority wins when several entities match.";
     section.append(description);
+    section.append(this.createField("Primary entity priority (default 0)", this.createNumberInput(
+      zone.priority ?? 0, -1000, 1000, 1,
+      (priority) => this.updateZone(zoneIndex, (current) => ({ ...current, priority })),
+    )));
     const validation = stateRuleValidation(zone.states ?? []);
     if (validation.duplicateValues.length) {
       const warning = document.createElement("p");
@@ -3697,6 +3777,115 @@ class FloorplanZoneCardEditor extends HTMLElement {
     return section;
   }
 
+  createEntityPicker(value, onChange) {
+    if (!customElements.get("ha-entity-picker")) {
+      return this.createTextInput(value, "binary_sensor.example", onChange);
+    }
+    const picker = document.createElement("ha-entity-picker");
+    picker.hass = this._hass;
+    picker.value = value || "";
+    picker.allowCustomEntity = true;
+    picker.addEventListener("value-changed", (event) => {
+      event.stopPropagation();
+      onChange(event.detail?.value ?? "");
+    });
+    return picker;
+  }
+
+  createAdditionalEntityRulesEditor(zone, zoneIndex) {
+    const section = document.createElement("div");
+    section.className = "additional-entity-rules";
+    const headingRow = document.createElement("div");
+    headingRow.className = "section-title";
+    const heading = document.createElement("strong");
+    heading.textContent = "Additional entity conditions";
+    headingRow.append(
+      heading,
+      this.createButton("Add condition", () => this.updateZone(zoneIndex, (current) => ({
+        ...current,
+        entity_rules: [...(current.entity_rules ?? []), newEntityRule()],
+      }), true), { compact: true }),
+    );
+    section.append(headingRow);
+    const hint = document.createElement("p");
+    hint.className = "hint";
+    hint.textContent = "Add any entity and its exact trigger state. The matching condition with the highest priority controls the zone; equal priorities keep the first configured match (primary entity first). Nonmatching states use the zone fallback; unavailable applies when all watched entities are unavailable.";
+    section.append(hint);
+
+    (zone.entity_rules ?? []).forEach((rule, ruleIndex) => {
+      const card = document.createElement("section");
+      card.className = "entity-condition-card";
+      const header = document.createElement("div");
+      header.className = "section-title";
+      const title = document.createElement("strong");
+      title.textContent = `Condition ${ruleIndex + 1}`;
+      header.append(title, this.createButton("Delete", () => this.updateZone(
+        zoneIndex,
+        (current) => ({
+          ...current,
+          entity_rules: (current.entity_rules ?? []).filter((_, index) => index !== ruleIndex),
+        }),
+        true,
+      ), { compact: true, kind: "danger" }));
+      card.append(header);
+
+      const edit = (patch) => this.updateZone(zoneIndex, (current) => {
+        const entityRules = deepClone(current.entity_rules ?? []);
+        entityRules[ruleIndex] = { ...entityRules[ruleIndex], ...patch };
+        return { ...current, entity_rules: entityRules };
+      });
+
+      const inputs = document.createElement("div");
+      inputs.className = "entity-condition-inputs";
+      inputs.append(
+        this.createField("Entity", this.createEntityPicker(rule.entity, (entity) => edit({ entity }))),
+        this.createField("State (exact)", this.createTextInput(rule.state, "on", (state) => edit({ state }))),
+        this.createField("Priority (higher wins)", this.createNumberInput(
+          rule.priority, -1000, 1000, 1, (priority) => edit({ priority }),
+        )),
+      );
+      card.append(inputs);
+
+      const styling = document.createElement("div");
+      styling.className = "entity-condition-styling";
+      styling.append(
+        this.createField("Color", this.createColorInput(rule.color, (color) => edit({ color }))),
+        this.createField("Opacity", this.createOpacityControl(rule.opacity, (opacity) => edit({ opacity }))),
+        this.createField("Effect", this.createSelect(rule.effect, [
+          { value: "none", label: "No effect" },
+          { value: "pulse", label: "Pulse" },
+          { value: "blink", label: "Blink" },
+        ], (effect) => edit({ effect }))),
+        this.createCheckbox("Highlight border", rule.highlight_border, (highlight_border) => edit({ highlight_border })),
+      );
+      card.append(styling);
+
+      const warnings = [];
+      if (!rule.entity) warnings.push("Select an entity.");
+      if (!rule.state) warnings.push("Enter an exact state value.");
+      if (UNAVAILABLE_ENTITY_STATES.has(rule.state)) warnings.push("Use the Unavailable / unknown style instead.");
+      const otherRules = (zone.entity_rules ?? []).slice(0, ruleIndex);
+      if (otherRules.some((other) => other.entity === rule.entity && other.state === rule.state)) {
+        warnings.push("Repeated entity and state; priority determines the winning condition.");
+      }
+      if (rule.entity && this._hass?.states?.[rule.entity]) {
+        const status = document.createElement("p");
+        status.className = "hint";
+        status.textContent = `Current state: ${entityRawState(this._hass, rule.entity)}`;
+        card.append(status);
+      }
+      if (warnings.length) {
+        const note = document.createElement("p");
+        note.className = "validation-warning";
+        note.textContent = warnings.join(" ");
+        card.append(note);
+      }
+      section.append(card);
+    });
+    return section;
+  }
+
+
   createStyleBox(titleText, styleValue, onChange) {
     const box = document.createElement("div");
     box.className = "style-box";
@@ -3764,7 +3953,11 @@ class FloorplanZoneCardEditor extends HTMLElement {
       .native-form,.action-form { display:block; max-width:100%; }
       .zone-native-form { margin-top:2px; }
       .grid,.style-grid,.label-style-grid,.svg-zone-add-row { display:grid; grid-template-columns:1fr; gap:12px; }
-      .state-rules,.actions-editor,.label-editor,.svg-geometry-editor { padding-top:10px; border-top:1px solid var(--divider-color,#ddd); }
+      .state-rules,.additional-entity-rules,.actions-editor,.label-editor,.svg-geometry-editor { padding-top:10px; border-top:1px solid var(--divider-color,#ddd); }
+      .additional-entity-rules { display:grid; gap:10px; }
+      .entity-condition-card { padding:10px; border:1px solid var(--divider-color,#ddd); border-radius:9px; display:grid; gap:10px; }
+      .entity-condition-inputs,.entity-condition-styling { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; }
+      .entity-condition-card ha-entity-picker { display:block; width:100%; min-width:0; }
       .svg-zone-add-row { align-items:end; }
       .auto-zoom-editor { gap:12px; }
       .auto-zoom-card { padding:12px; border:1px solid var(--divider-color,#ddd); border-radius:9px; background:color-mix(in srgb,var(--secondary-background-color,#eee) 18%,transparent); }
@@ -3787,6 +3980,8 @@ class FloorplanZoneCardEditor extends HTMLElement {
       @container (min-width:600px) {
         .grid,.style-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
         .svg-zone-add-row { grid-template-columns:minmax(0,1fr) auto; }
+        .entity-condition-inputs { grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr); }
+        .entity-condition-styling { grid-template-columns:54px minmax(140px,1fr) minmax(110px,1fr) auto; align-items:end; }
       }
       @container (min-width:760px) {
         .label-style-grid { grid-template-columns:54px minmax(120px,.7fr) minmax(130px,.9fr) minmax(160px,1.2fr); align-items:end; }
@@ -4088,6 +4283,7 @@ class FloorplanZoneCardEditor extends HTMLElement {
           this.createLabelEditor(zone, index),
           this.createActionsEditor(zone, index),
           this.createStateRulesEditor(zone, index),
+          this.createAdditionalEntityRulesEditor(zone, index),
         );
         const hint = document.createElement("p");
         hint.className = "hint";
