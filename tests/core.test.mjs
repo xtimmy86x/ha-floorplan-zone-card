@@ -10,7 +10,11 @@ async function loadCore() {
     console: { ...console, info() {} },
     setTimeout,
     clearTimeout,
-    HTMLElement: class HTMLElement {},
+    HTMLElement: class HTMLElement {
+      attachShadow() {
+        this.shadowRoot = {};
+      }
+    },
     Event: class Event {
       constructor(type, options = {}) {
         this.type = type;
@@ -56,6 +60,7 @@ async function loadCore() {
     activeFloorplanTheme,
     themeImageConfigKey,
     dualThemeSvgWarnings,
+    FloorplanZoneCardEditor,
   };`;
   vm.runInContext(source + expose, context, { filename: "ha-floorplan-zone-card.js" });
   return context.__core;
@@ -370,4 +375,51 @@ test("runtime source code reacts to Home Assistant darkMode changes", async () =
   assert.match(source, /activeImageSource\(this\._config, this\._hass\)/);
   assert.match(source, /image_dark/);
   assert.match(source, /Dark floorplan \(optional\)/);
+});
+
+test("editor keeps inputs mounted when Home Assistant echoes state typing", () => {
+  const editor = new core.FloorplanZoneCardEditor();
+  let renders = 0;
+  let previews = 0;
+  editor.render = () => { renders += 1; };
+  editor.updatePreview = () => { previews += 1; };
+
+  editor.setConfig({
+    title: "Original",
+    zones: [{
+      id: "zone_1",
+      entity: "sensor.status",
+      states: [{ value: "on", color: "#ff0000", opacity: 0.5 }],
+    }],
+    auto_zoom: [{ entity: "sensor.status", state: "on", target: "zone", zone_id: "zone_1" }],
+  });
+  assert.equal(renders, 1);
+
+  // The dashboard sends the same config back synchronously after each edit.
+  editor.dispatchEvent = (event) => {
+    if (event.type === "config-changed") editor.setConfig(event.detail.config);
+    return true;
+  };
+
+  for (const value of ["a", "al", "ala", "alar", "alarm"]) {
+    editor.updateZone(0, (zone) => ({
+      ...zone,
+      states: [{ ...zone.states[0], value }],
+    }));
+  }
+
+  assert.equal(editor._config.zones[0].states[0].value, "alarm");
+  assert.equal(previews, 5);
+  assert.equal(renders, 1, "echoes must not rebuild a focused state input");
+
+  for (const value of ["w", "wa", "warn", "warning"]) {
+    editor.updateAutoZoomRule(0, (rule) => ({ ...rule, state: value }));
+  }
+  assert.equal(editor._config.auto_zoom[0].state, "warning");
+  assert.equal(renders, 1, "auto zoom text inputs must also keep focus");
+
+  // Actual external changes still require a render.
+  editor.setConfig({ ...structuredClone(editor._config), title: "External change" });
+  assert.equal(renders, 2);
+  assert.equal(editor._config.title, "External change");
 });
