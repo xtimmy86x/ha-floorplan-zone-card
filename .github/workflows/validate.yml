@@ -30,3 +30,47 @@ jobs:
           # Repository metadata/images will be completed before any future
           # submission to the HACS default repository list.
           ignore: description topics images
+
+  publish_030:
+    needs: [build, hacs]
+    if: "${{ github.event_name == 'push' && github.event.head_commit.message == 'chore: publish v0.3.0' }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ca65e6cfdfae56c5ea70e39ebf7137a065d4b0dc
+      - name: Publish v0.3.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > /tmp/release-notes.md <<'EOF'
+          ## Floorplan Zone Card 0.3.0
+          
+          This release introduces multiple Home Assistant entities per floorplan zone, with configurable visual priority.
+          
+          ### Added
+          - Additional entity conditions for each zone, with exact state matching and a configurable priority.
+          - Independent color, opacity, pulse/blink effect, and highlighted border for every additional condition.
+          - Visual editor controls to add, configure, and remove entity conditions.
+          - Priority for the existing primary zone entity (default 0).
+          
+          ### Behavior
+          - The highest-priority matching condition determines the zone appearance.
+          - When priorities tie, the primary entity wins first, followed by the first configured additional condition.
+          - Missing or unavailable entities do not suppress an active condition from another entity.
+          - The zone uses its fallback styling if an entity is available but no rule matches; unavailable styling is used when all watched entities are unavailable.
+          
+          ### Compatibility
+          - Existing single-entity zone configurations continue to work without migration.
+          - No changes are needed to SVG object IDs, light/dark floorplans, actions or existing labels.
+          
+          ### Quality
+          - Added regression tests for precedence, ties, visual effects, unavailable states and editor typing behavior.
+          
+          EOF
+          gh release create v0.3.0 dist/ha-floorplan-zone-card.js \
+            --target ca65e6cfdfae56c5ea70e39ebf7137a065d4b0dc \
+            --title "Floorplan Zone Card 0.3.0" \
+            --notes-file /tmp/release-notes.md
