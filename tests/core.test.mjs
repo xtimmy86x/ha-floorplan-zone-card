@@ -314,7 +314,7 @@ test("SVG object overlay uses the floorplan viewport directly", async () => {
 
 test("editor UI is container-responsive and collapsible", async () => {
   const source = await readFile(new URL("../src/ha-floorplan-zone-card.js", import.meta.url), "utf8");
-  assert.match(source, /const VERSION = "0\.2\.1"/);
+  assert.match(source, /const VERSION = "0\.3\.0"/);
   assert.match(source, /container-type:inline-size/);
   assert.match(source, /@container \(min-width:600px\)/);
   assert.match(source, /this\._workspaceOpen = false/);
