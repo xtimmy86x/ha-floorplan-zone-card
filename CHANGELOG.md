@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Keep the visual editor's text field focus and scroll position stable while Home Assistant echoes configuration updates on each keystroke.
+
 ## 0.2.0 - 2026-08-29
 
 ### Added

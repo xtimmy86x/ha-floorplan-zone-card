@@ -2488,8 +2488,15 @@ class FloorplanZoneCardEditor extends HTMLElement {
   }
 
   setConfig(config) {
+    const nextConfig = normalizedConfig(config);
+    // Home Assistant echoes config-changed back through setConfig(). Rendering an
+    // identical config destroys the focused input and resets the editor scroll.
+    if (this._config && JSON.stringify(this._config) === JSON.stringify(nextConfig)) {
+      return;
+    }
+
     const previousImages = themeImageConfigKey(this._config);
-    this._config = normalizedConfig(config);
+    this._config = nextConfig;
     if (previousImages !== themeImageConfigKey(this._config)) {
       this._svgElements = [];
       this._svgSourceError = "";
