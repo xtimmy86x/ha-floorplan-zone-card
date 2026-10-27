@@ -50,6 +50,9 @@ async function loadCore() {
     stateRuleValidation,
     normalizedConfig,
     stateStyle,
+    resolvedZoneState,
+    normalizePriority,
+    normalizeEntityRule,
     autoZoomRuleValidation,
     viewForFocusArea,
     matchingAutoZoomRule,
@@ -422,4 +425,125 @@ test("editor keeps inputs mounted when Home Assistant echoes state typing", () =
   editor.setConfig({ ...structuredClone(editor._config), title: "External change" });
   assert.equal(renders, 2);
   assert.equal(editor._config.title, "External change");
+});
+
+test("normalizes multi-entity state rules without breaking existing zones", () => {
+  const first = core.normalizedConfig({
+    zones: [{
+      id: "z1",
+      entity: "binary_sensor.a",
+      states: [{ value: "on", color: "#cc0000", opacity: 0.5 }],
+      entity_rules: [
+        { entity: " sensor.b ", state: "on", priority: 20, color: "#00ff00", opacity: 0.9, effect: "blink", highlight_border: true },
+        { entity: "sensor.c", state: "warning", priority: 20.8, color: "#ffcc00", effect: "pulse" },
+        { entity: "sensor.d", state: "on", priority: "bad", color: "", effect: "invalid" },
+      ],
+    }],
+  }).zones[0];
+  assert.equal(first.priority, 0);
+  assert.equal(first.entity_rules.length, 3);
+  assert.equal(first.entity_rules[0].entity, "sensor.b");
+  assert.equal(first.entity_rules[0].priority, 20);
+  assert.equal(first.entity_rules[0].effect, "blink");
+  assert.equal(first.entity_rules[0].highlight_border, true);
+  assert.equal(first.entity_rules[1].priority, 20);
+  assert.equal(first.entity_rules[2].priority, 10);
+  assert.equal(first.entity_rules[2].effect, "none");
+  assert.equal(core.normalizePriority(999999), 1000);
+  assert.equal(core.normalizePriority(-999999), -1000);
+  assert.equal(core.normalizePriority(""), 0);
+  assert.deepEqual(structuredClone(core.normalizedConfig({ zones: [{ id: "old", entity: "sensor.old" }] }).zones[0].entity_rules), []);
+});
+
+test("multiple matching entities use highest priority then configuration order", () => {
+  const zone = core.normalizedConfig({
+    zones: [{
+      id: "z1",
+      entity: "binary_sensor.primary",
+      priority: 5,
+      states: [{ value: "on", color: "#ff0000" }],
+      entity_rules: [
+        { entity: "binary_sensor.warning", state: "on", priority: 10, color: "#ffff00", effect: "pulse", highlight_border: false },
+        { entity: "binary_sensor.alarm", state: "on", priority: 100, color: "#dd0000", effect: "blink", highlight_border: true },
+      ],
+      default: { color: "#aaaaaa", opacity: 0.1 },
+      unavailable: { color: "#bbbbbb", opacity: 0.2 },
+    }],
+  }).zones[0];
+  const hass = { states: {
+    "binary_sensor.primary": { state: "on" },
+    "binary_sensor.warning": { state: "on" },
+    "binary_sensor.alarm": { state: "off" },
+  } };
+
+  assert.equal(core.stateStyle(hass, zone).color, "#ffff00");
+  assert.equal(core.resolvedZoneState(hass, zone).entity, "binary_sensor.warning");
+  hass.states["binary_sensor.alarm"].state = "on";
+  assert.equal(core.stateStyle(hass, zone).color, "#dd0000");
+  assert.equal(core.stateStyle(hass, zone).effect, "blink");
+  assert.equal(core.stateStyle(hass, zone).highlight_border, true);
+  hass.states["binary_sensor.alarm"].state = "off";
+  hass.states["binary_sensor.warning"].state = "off";
+  assert.equal(core.stateStyle(hass, zone).color, "#ff0000");
+
+  zone.entity_rules[0].priority = 5;
+  hass.states["binary_sensor.warning"].state = "on";
+  assert.equal(core.stateStyle(hass, zone).color, "#ff0000", "primary wins an equal priority");
+  zone.entity_rules[0].priority = 6;
+  assert.equal(core.stateStyle(hass, zone).color, "#ffff00");
+});
+
+test("unavailable sources do not mask other available conditions or fallback", () => {
+  const zone = core.normalizedConfig({
+    zones: [{
+      entity: "sensor.primary",
+      states: [],
+      default: { color: "#111111" },
+      unavailable: { color: "#999999" },
+      entity_rules: [
+        { entity: "sensor.secondary", state: "warning", priority: 10, color: "#ffcc00" },
+        { entity: "sensor.alarm", state: "on", priority: 20, color: "#ff0000" },
+      ],
+    }],
+  }).zones[0];
+
+  const hass = { states: {
+    "sensor.primary": { state: "unavailable" },
+    "sensor.secondary": { state: "normal" },
+    "sensor.alarm": { state: "unknown" },
+  } };
+  assert.equal(core.stateStyle(hass, zone).color, "#111111");
+  hass.states["sensor.secondary"].state = "warning";
+  assert.equal(core.stateStyle(hass, zone).color, "#ffcc00");
+  hass.states["sensor.secondary"].state = "unavailable";
+  assert.equal(core.stateStyle(hass, zone).color, "#999999");
+  hass.states["sensor.alarm"].state = "on";
+  assert.equal(core.stateStyle(hass, zone).color, "#ff0000");
+
+  const legacy = core.normalizedConfig({
+    zones: [{ entity: "binary_sensor.legacy", states: [{ value: "on", color: "#00aa00" }] }],
+  }).zones[0];
+  assert.equal(core.stateStyle({ states: { "binary_sensor.legacy": { state: "on" } } }, legacy).color, "#00aa00");
+});
+
+test("additional entity rules keep effects and can be edited without full rerender", () => {
+  const editor = new core.FloorplanZoneCardEditor();
+  let renders = 0;
+  editor.render = () => { renders += 1; };
+  editor.updatePreview = () => {};
+  editor.setConfig({ zones: [{ id: "zone_1", entity_rules: [{ entity: "sensor.a", state: "on", priority: 10 }] }] });
+  editor.dispatchEvent = (event) => {
+    if (event.type === "config-changed") editor.setConfig(event.detail.config);
+    return true;
+  };
+  for (const state of ["a", "al", "ala", "alarm"]) {
+    editor.updateZone(0, (zone) => ({
+      ...zone,
+      entity_rules: [{ ...zone.entity_rules[0], state }],
+    }));
+  }
+  assert.equal(renders, 1);
+  assert.equal(editor._config.zones[0].entity_rules[0].state, "alarm");
+  const source = core.normalizedConfig(editor._config).zones[0];
+  assert.equal(source.entity_rules[0].priority, 10);
 });
